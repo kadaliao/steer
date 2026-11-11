@@ -282,11 +282,86 @@ class SuggestionAndCommandTests(unittest.TestCase):
                     json.dump(d, f)
             with open(os.path.join(root, "4.json"), "w") as f:
                 f.write("{broken")
-            self.assertEqual(steerd.claude_open_sessions(root), {"live": os.getpid()})
+            found = steerd.claude_open_sessions(root)
+            self.assertEqual(list(found), ["live"])
+            self.assertEqual(found["live"]["pid"], os.getpid())
 
     def test_skill_mentions(self):
         found = steerd.SKILL_MENTION.findall("use $pdf and $skill-creator. not a$b or $$x, cost $5")
         self.assertEqual([n.rstrip(".:-") for n in found], ["pdf", "skill-creator", "5"])
+
+
+class TerminalSyncTests(unittest.TestCase):
+    def test_websocket_frames_round_trip(self):
+        async def run():
+            reader = asyncio.StreamReader()
+            # A masked fragmented text message, a ping in between, then a close.
+            first = steerd.ws_frame(1, b'{"a":', mask=True)
+            first = bytes([first[0] & 0x7F]) + first[1:]           # not final
+            ping = steerd.ws_frame(9, b"hi", mask=False)
+            last = steerd.ws_frame(0, b' 1}', mask=False)
+            big = steerd.ws_frame(1, b"x" * 70000, mask=False)
+            reader.feed_data(first + ping + last + big + steerd.ws_frame(8, b"", mask=False))
+            reader.feed_eof()
+
+            class Writer:
+                written = b""
+                def write(self, data):
+                    Writer.written += data
+            conn = steerd.WSConn(reader, Writer())
+            self.assertEqual(await conn.recv(), '{"a": 1}')
+            self.assertEqual(Writer.written[0] & 0x0F, 10)           # answered the ping with a pong
+            self.assertEqual(len(await conn.recv()), 70000)
+            self.assertIsNone(await conn.recv())
+            self.assertTrue(conn.closed)
+        asyncio.run(run()) if hasattr(asyncio, "run") else asyncio.get_event_loop().run_until_complete(run())
+
+    def test_masking_is_reversible(self):
+        key = b"\x01\x02\x03\x04"
+        data = "你好 steer".encode()
+        self.assertEqual(steerd.ws_mask(key, steerd.ws_mask(key, data)), data)
+
+    def test_resume_command_keeps_the_terminal_flags(self):
+        self.assertEqual(steerd.resume_command(["claude", "--dangerously-skip-permissions", "--resume"], "abc"),
+                         "claude --dangerously-skip-permissions --resume abc")
+        self.assertEqual(steerd.resume_command(["/x/claude", "--model", "opus", "fix the bug", "-c",
+                                                "--permission-mode=plan"], "abc"),
+                         "claude --model opus --permission-mode=plan --resume abc")
+
+    def test_tail_follows_lines_a_terminal_appends(self):
+        import json, tempfile
+        def line(m):
+            return (json.dumps(m) + "\n").encode()
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "t.jsonl")
+            with open(path, "wb") as f:
+                f.write(line({"type": "user", "uuid": "u1", "message": {"role": "user", "content": "hi"}}))
+            hub = FakeHub()
+            s = steerd.ClaudeSession(hub, {"sid": "t", "agent": "claude", "cwd": root})
+            transcript, offset = s._read_transcript(path)
+            for item in transcript.items:
+                s.put(item, emit=False)
+            transcript.listener = s.from_transcript
+            s.transcript, s.transcript_path, s.tail_offset, s.loaded = transcript, path, offset, True
+            with open(path, "ab") as f:
+                f.write(line({"type": "assistant", "message": {"id": "m1", "content": [{"type": "text", "text": "hello"}]}}))
+                f.write(b'{"type": "user", "uuid": "u2", "mess')        # still being written
+            s.tail_transcript()
+            texts = [m["item"].get("text") for m in hub.sent if m.get("ev") == "item"]
+            self.assertEqual(texts, ["hello"])
+            with open(path, "ab") as f:
+                f.write(b'age": {"role": "user", "content": "more"}}\n')
+            s.tail_transcript()
+            self.assertEqual([i.get("text") for i in s.items], ["hi", "hello", "more"])
+
+    def test_terminal_state_shows_on_the_session(self):
+        s = steerd.ClaudeSession(FakeHub(), {"sid": "t2", "agent": "claude", "cwd": "/w"})
+        s.follow_terminal({"pid": 999999, "status": "working", "cwd": "/w"})
+        self.assertEqual(s.state, "running")
+        s.follow_terminal({"pid": 999999, "status": "idle", "cwd": "/w"})
+        self.assertEqual(s.state, "idle")
+        s.follow_terminal(None)
+        self.assertIsNone(s.terminal)
 
 
 if __name__ == "__main__":

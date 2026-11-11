@@ -25,15 +25,17 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import time
 import uuid
 
-VERSION = "0.2.1"
+VERSION = "0.3.2"
 PROTO = 1
 
 HOME = os.path.expanduser("~")
@@ -50,6 +52,10 @@ OUTPUT_TAIL = 4000
 DIFF_LIMIT = 40000
 SNAPSHOT_ITEMS = 400
 CLAUDE_IDLE_EXIT = 30 * 60
+# After a phone turn on a session taken over from a herdr/tmux pane, how long
+# to wait (idle) before reopening it in that pane.
+HANDBACK_DELAY = int(os.environ.get("STEER_HANDBACK_DELAY", "60"))
+TAKEOVER_WAIT = 30 * 60
 HISTORY_DAYS = 30
 HISTORY_LIMIT = 80
 
@@ -246,19 +252,28 @@ def clean_user_text(text: str) -> str:
 class ClaudeTranscript:
     """Build timeline items from Claude's own jsonl transcript."""
 
-    def __init__(self, cwd: str):
+    def __init__(self, cwd: str, listener=None):
         self.cwd = cwd
         self.items = []
         self.index = {}
         self.title = None
         self.text_counts = {}
+        self.listener = listener  # called with each new or changed item
 
     def put(self, item):
         if item["id"] in self.index:
-            self.items[self.index[item["id"]]].update(item)
+            current = self.items[self.index[item["id"]]]
+            current.update(item)
+            item = current
         else:
             self.index[item["id"]] = len(self.items)
             self.items.append(item)
+        if self.listener:
+            self.listener(item)
+
+    def emit_item(self, item):
+        if self.listener:
+            self.listener(item)
 
     def get(self, item_id):
         pos = self.index.get(item_id)
@@ -589,14 +604,16 @@ def codex_item(item: dict, cwd: str, client_ids: dict):
 
 COMMANDS_TTL = 600
 _open_cache = [0.0, {}]
+TERMINAL_IDLE = ("idle", "done", "")
 
 
-def claude_open_sessions(root=None):
-    """sessionId -> pid for each Claude session a terminal has open right now,
-    from the registry Claude Code keeps in ~/.claude/sessions/<pid>.json
-    (`entrypoint: cli`; print-mode processes say `sdk-cli`)."""
+def claude_open_sessions(root=None, max_age=1.0):
+    """sessionId -> {pid, status, cwd} for each Claude session a terminal has
+    open right now, from the registry Claude Code keeps in
+    ~/.claude/sessions/<pid>.json (`entrypoint: cli`; print-mode processes,
+    Steer's own included, say `sdk-cli`)."""
     now = time.time()
-    if root is None and now - _open_cache[0] < 3:
+    if root is None and now - _open_cache[0] < max_age:
         return _open_cache[1]
     found = {}
     for path in glob.glob(os.path.join(root or os.path.join(HOME, ".claude", "sessions"), "*.json")):
@@ -604,17 +621,252 @@ def claude_open_sessions(root=None):
             with open(path) as f:
                 d = json.load(f)
             pid = int(d.get("pid") or 0)
-            # `claude -p` (Steer's own, or any SDK host) registers too, as sdk-*.
             if d.get("kind") != "interactive" or str(d.get("entrypoint") or "").startswith("sdk") \
                     or not pid or not d.get("sessionId"):
                 continue
             os.kill(pid, 0)
         except (OSError, ValueError, TypeError, AttributeError):
             continue
-        found[d["sessionId"]] = pid
+        found[d["sessionId"]] = {"pid": pid, "status": str(d.get("status") or ""), "cwd": d.get("cwd") or ""}
     if root is None:
         _open_cache[:] = [now, found]
     return found
+
+
+def pid_alive(pid) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+async def wait_exit(pid, timeout) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not pid_alive(pid):
+            return True
+        await asyncio.sleep(0.2)
+    return not pid_alive(pid)
+
+
+TERMINAL_ENV_KEYS = ("HERDR_PANE_ID", "HERDR_SOCKET_PATH", "HERDR_BIN_PATH", "TMUX", "TMUX_PANE")
+
+
+def process_env(pid) -> dict:
+    """The terminal-multiplexer variables in another process's environment."""
+    env = {}
+    try:
+        if sys.platform.startswith("linux"):
+            with open("/proc/%d/environ" % pid, "rb") as f:
+                pairs = [p.decode("utf-8", "replace") for p in f.read().split(b"\0")]
+        else:
+            out = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)], stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, timeout=5).stdout.decode("utf-8", "replace")
+            pairs = out.split()
+    except (OSError, subprocess.SubprocessError):
+        return env
+    for pair in pairs:
+        key, _, value = pair.partition("=")
+        if key in TERMINAL_ENV_KEYS and value:
+            env[key] = value
+    return env
+
+
+def process_argv(pid) -> list:
+    try:
+        out = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=5).stdout.decode("utf-8", "replace")
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return out.split()
+
+
+_terminal_cache = {}
+
+
+def _run_sync(args, env=None, timeout=5):
+    try:
+        return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env,
+                              timeout=timeout).stdout.decode("utf-8", "replace")
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def process_ancestors(pid) -> list:
+    """Parent, grandparent, … of a process, nearest first."""
+    parent = {}
+    for line in _run_sync(["ps", "-A", "-o", "pid=,ppid="]).splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            parent[int(parts[0])] = int(parts[1])
+    chain, cur = [], pid
+    while cur in parent and parent[cur] not in chain and parent[cur] > 1:
+        cur = parent[cur]
+        chain.append(cur)
+    return chain
+
+
+def process_stat(pid):
+    """(process group, terminal's foreground process group, tty name) of a process."""
+    parts = _run_sync(["ps", "-o", "pgid=,tpgid=,tty=", "-p", str(pid)]).split()
+    if len(parts) < 3 or not parts[0].isdigit():
+        return None, None, None
+    return int(parts[0]), int(parts[1]) if parts[1].lstrip("-").isdigit() else None, parts[2]
+
+
+def pane_shell_if_foreground(term, pgid, tpgid, tty):
+    """The pane's shell pid when the process is the pane's foreground job;
+    None when it is not (or the pane cannot be asked)."""
+    if term["via"] == "herdr":
+        out = _run_sync([term["bin"], "pane", "process-info", "--pane", term["pane"]], env=_term_env(term))
+        try:
+            info = json.loads(out)["result"]["process_info"]
+            if int(info["foreground_process_group_id"]) == pgid:
+                return int(info["shell_pid"])
+        except (ValueError, KeyError, TypeError):
+            pass
+        return None
+    out = _run_sync([term["bin"], "-S", term["socket"], "display-message", "-p", "-t", term["pane"],
+                     "#{pane_pid} #{pane_tty}"]).split()
+    if len(out) == 2 and out[0].isdigit() and tty and out[1].endswith("/" + tty) and pgid == tpgid:
+        return int(out[0])
+    return None
+
+
+def terminal_of(pid) -> dict:
+    """Where a terminal Claude runs: a herdr pane, a tmux pane, or a plain
+    shell (which Steer cannot type into). Multiplexers nest and children
+    inherit their variables (a tmux started inside herdr carries both), so a
+    pane counts only when the process is that pane's foreground job, and the
+    nearest such pane wins. Anything unconfirmed is treated as a plain shell,
+    where Steer only ever signals that one process."""
+    if pid in _terminal_cache:
+        return _terminal_cache[pid]
+    env = process_env(pid)
+    candidates = []
+    if env.get("HERDR_PANE_ID"):
+        herdr = env.get("HERDR_BIN_PATH") if os.path.exists(env.get("HERDR_BIN_PATH") or "") else find_bin("herdr")
+        if herdr:
+            candidates.append({"via": "herdr", "pane": env["HERDR_PANE_ID"], "socket": env.get("HERDR_SOCKET_PATH"),
+                               "bin": herdr})
+    if env.get("TMUX_PANE") and env.get("TMUX"):
+        tmux = find_bin("tmux")
+        if tmux:
+            candidates.append({"via": "tmux", "pane": env["TMUX_PANE"], "socket": env["TMUX"].split(",")[0],
+                               "bin": tmux})
+    term = {"via": "shell"}
+    if candidates:
+        pgid, tpgid, tty = process_stat(pid)
+        ancestors = process_ancestors(pid)
+        ranked = []
+        for cand in candidates:
+            shell = pane_shell_if_foreground(cand, pgid, tpgid, tty) if pgid else None
+            if shell in ancestors:
+                ranked.append((ancestors.index(shell), cand))
+        if ranked:
+            term = sorted(ranked, key=lambda r: r[0])[0][1]
+    if len(_terminal_cache) > 200:
+        _terminal_cache.clear()
+    _terminal_cache[pid] = term
+    return term
+
+
+TMUX_KEYS = {"ctrl+c": "C-c", "escape": "Escape", "enter": "Enter"}
+SHELLS = ("fish", "zsh", "bash", "sh", "dash", "ksh", "tcsh", "nu", "xonsh", "elvish")
+
+
+def _term_env(term):
+    env = dict(os.environ)
+    if term.get("via") == "herdr" and term.get("socket"):
+        env["HERDR_SOCKET_PATH"] = term["socket"]
+    return env
+
+
+async def term_command(term, args, timeout=15):
+    proc = await asyncio.create_subprocess_exec(*args, env=_term_env(term), stdin=asyncio.subprocess.DEVNULL,
+                                                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return -1, ""
+    return proc.returncode, out.decode("utf-8", "replace")
+
+
+async def terminal_keys(term, *keys):
+    if term.get("via") == "herdr":
+        code, _ = await term_command(term, [term["bin"], "pane", "send-keys", term["pane"]] + list(keys))
+    elif term.get("via") == "tmux":
+        code, _ = await term_command(term, [term["bin"], "-S", term["socket"], "send-keys", "-t", term["pane"]]
+                                     + [TMUX_KEYS.get(k, k) for k in keys])
+    else:
+        return False
+    return code == 0
+
+
+async def terminal_run(term, command):
+    """Types a command line into the pane's shell and presses Enter."""
+    if term.get("via") == "herdr":
+        code, _ = await term_command(term, [term["bin"], "pane", "run", term["pane"], command])
+    elif term.get("via") == "tmux":
+        code, _ = await term_command(term, [term["bin"], "-S", term["socket"], "send-keys", "-t", term["pane"],
+                                            "-l", command])
+        if code == 0:
+            code, _ = await term_command(term, [term["bin"], "-S", term["socket"], "send-keys", "-t", term["pane"],
+                                                "Enter"])
+    else:
+        return False
+    return code == 0
+
+
+async def terminal_at_shell(term) -> bool:
+    """True when the pane still exists and its shell is in the foreground."""
+    if term.get("via") == "herdr":
+        code, out = await term_command(term, [term["bin"], "pane", "process-info", "--pane", term["pane"]])
+        try:
+            info = json.loads(out)["result"]["process_info"]
+        except (ValueError, KeyError, TypeError):
+            return False
+        return code == 0 and info.get("foreground_process_group_id") == info.get("shell_pid")
+    if term.get("via") == "tmux":
+        code, out = await term_command(term, [term["bin"], "-S", term["socket"], "display-message", "-p", "-t",
+                                              term["pane"], "#{pane_current_command}"])
+        return code == 0 and os.path.basename(out.strip()).lstrip("-") in SHELLS
+    return False
+
+
+RESUME_FLAGS = {"--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--verbose",
+                "--chrome", "--no-chrome", "--ide", "--strict-mcp-config"}
+RESUME_VALUE_FLAGS = {"--model", "--permission-mode", "--effort", "--add-dir", "--settings", "--agent",
+                      "--mcp-config", "--plugin-dir", "--fallback-model"}
+
+
+def resume_command(argv, session_id) -> str:
+    """`claude <the terminal's own flags> --resume <id>`: keeps flags such as
+    --dangerously-skip-permissions or --model, drops prompts and other
+    resume/continue arguments."""
+    out = ["claude"]
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        name = arg.split("=", 1)[0]
+        if name in RESUME_FLAGS:
+            out.append(arg)
+        elif name in RESUME_VALUE_FLAGS:
+            if "=" in arg:
+                out.append(arg)
+            elif i + 1 < len(argv):
+                out += [arg, argv[i + 1]]
+                i += 1
+        i += 1
+    out += ["--resume", session_id]
+    return " ".join(shlex.quote(a) for a in out)
+
+
 SKILL_MENTION = re.compile(r"(?<![\w$])\$([A-Za-z0-9][\w:.-]*)")
 
 
@@ -709,6 +961,10 @@ class Session:
 
     def is_live(self) -> bool:
         return False
+
+    def holds_helper(self) -> bool:
+        """Work that would be lost if the helper restarted now."""
+        return bool(self.pending) or (self.is_live() and self.state == "running")
 
     # timeline ---------------------------------------------------------
     def get(self, item_id):
@@ -839,6 +1095,15 @@ class ClaudeSession(Session):
         self.stream_items = {}
         self.queued = []
         self.reader_task = None
+        # Following the session while a terminal has it open.
+        self.transcript = None
+        self.transcript_path = None
+        self.tail_offset = 0
+        self.terminal = None        # registry entry while a terminal has it open
+        self.takeover_task = None
+        self.takeover_queue = []    # (item, content) waiting for the terminal to let go
+        self.handback = None        # {"term", "argv"}: reopen it there once the phone is done
+        self.handback_task = None
 
     @property
     def native_id(self):
@@ -847,10 +1112,26 @@ class ClaudeSession(Session):
     def is_live(self):
         return self.proc is not None and self.proc.returncode is None
 
+    def holds_helper(self) -> bool:
+        return super().holds_helper() or bool(self.queued or self.takeover_task or self.handback)
+
+    def foreign_terminal(self, entry=None):
+        """The registry entry of a terminal holding this session, if it is not ours."""
+        entry = entry if entry is not None else claude_open_sessions().get(self.native_id)
+        if entry and not (self.proc is not None and self.proc.pid == entry["pid"]):
+            return entry
+        return None
+
     def summary(self) -> dict:
         d = super().summary()
-        pid = claude_open_sessions().get(self.native_id)
-        d["openInTerminal"] = bool(pid) and not (self.proc is not None and self.proc.pid == pid)
+        entry = self.foreign_terminal()
+        d["openInTerminal"] = bool(entry)
+        if entry:
+            d["terminal"] = {"via": terminal_of(entry["pid"]).get("via"), "status": entry.get("status") or ""}
+            if not self.is_live() and entry.get("status") not in TERMINAL_IDLE and d["state"] == "idle":
+                d["state"] = "running"
+        if self.handback:
+            d["handback"] = self.handback["term"].get("via")
         return d
 
     async def load(self):
@@ -861,7 +1142,9 @@ class ClaudeSession(Session):
         if not path:
             return
         loop = asyncio.get_event_loop()
-        transcript = await loop.run_in_executor(None, self._read_transcript, path)
+        transcript, offset = await loop.run_in_executor(None, self._read_transcript, path)
+        self.transcript_path = path
+        self.tail_offset = offset
         live_items = self.items
         self.items, self.index = [], {}
         for item in transcript.items:
@@ -871,6 +1154,8 @@ class ClaudeSession(Session):
                 self.put(item, emit=False)
         if transcript.title and not self.meta.get("titleLocked"):
             self.meta["title"] = transcript.title
+        transcript.listener = self.from_transcript
+        self.transcript = transcript
         for item in reversed(self.items):
             if item.get("kind") == "assistant" and (item.get("text") or "").strip():
                 self.last_text = one_line(item["text"], 160)
@@ -879,9 +1164,130 @@ class ClaudeSession(Session):
     def _read_transcript(self, path):
         transcript = ClaudeTranscript(self.cwd)
         with open(path, "rb") as f:
-            for m in iter_json_lines(f.read()):
-                transcript.feed(m)
-        return transcript
+            data = f.read()
+        cut = data.rfind(b"\n") + 1  # a half-written last line is read on the next pass
+        for m in iter_json_lines(data[:cut]):
+            transcript.feed(m)
+        return transcript, cut
+
+    # following a terminal -----------------------------------------------
+    def from_transcript(self, item):
+        self.put(item)
+
+    def tail_transcript(self):
+        """Feeds lines the terminal appended since the last look."""
+        if self.transcript is None or not self.transcript_path:
+            return
+        try:
+            size = os.path.getsize(self.transcript_path)
+        except OSError:
+            return
+        if size < self.tail_offset:
+            self.tail_offset = size
+        if size == self.tail_offset:
+            return
+        with open(self.transcript_path, "rb") as f:
+            f.seek(self.tail_offset)
+            data = f.read(size - self.tail_offset)
+        cut = data.rfind(b"\n") + 1
+        if not cut:
+            return
+        self.tail_offset += cut
+        for m in iter_json_lines(data[:cut]):
+            try:
+                self.transcript.feed(m)
+            except Exception as e:
+                log("transcript line skipped", self.sid, repr(e))
+
+    def skip_transcript(self):
+        """What our own process wrote is already on screen from its stream."""
+        if self.transcript_path:
+            try:
+                self.tail_offset = os.path.getsize(self.transcript_path)
+            except OSError:
+                pass
+
+    def follow_terminal(self, entry):
+        entry = self.foreign_terminal(entry) if entry else None
+        prev = self.terminal
+        self.terminal = entry
+        if (entry or prev) and self.loaded:
+            self.tail_transcript()
+        if (prev or {}).get("status") == (entry or {}).get("status") and bool(prev) == bool(entry):
+            return
+        if not self.is_live() and not self.takeover_task:
+            busy = bool(entry) and entry.get("status") not in TERMINAL_IDLE
+            want = "running" if busy else "idle"
+            if self.state != want:
+                self.set_state(want)
+                return
+        self.touch(urgent=True)
+
+    async def take_over(self):
+        """A terminal has this session open: wait until it is idle, then close
+        it there (Ctrl+C twice in a herdr or tmux pane, SIGTERM in a plain
+        shell) so only one process writes the conversation."""
+        entry = self.foreign_terminal(claude_open_sessions(max_age=0).get(self.native_id))
+        deadline = time.time() + TAKEOVER_WAIT
+        while entry and entry.get("status") not in TERMINAL_IDLE:
+            if time.time() > deadline:
+                raise OpError("terminal_busy", "电脑终端里的 Claude 一直没空下来，没能接管")
+            await asyncio.sleep(1)
+            entry = self.foreign_terminal(claude_open_sessions(max_age=0).get(self.native_id))
+        if not entry:
+            return
+        pid = entry["pid"]
+        term = terminal_of(pid)
+        argv = process_argv(pid)
+        log("claude takeover", self.sid, term.get("via"), pid)
+        if term["via"] in ("herdr", "tmux"):
+            # The first Ctrl+C clears any half-typed input; the next one exits.
+            for _ in range(3):
+                await terminal_keys(term, "ctrl+c")
+                if await wait_exit(pid, 1.5):
+                    break
+        if pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        if not await wait_exit(pid, 6):
+            raise OpError("terminal_busy", "电脑终端里的 Claude 没有退出")
+        if term["via"] in ("herdr", "tmux"):
+            self.handback = {"term": term, "argv": argv}
+        self.terminal = None
+        _open_cache[0] = 0
+        self.tail_transcript()
+        self.touch(urgent=True)
+
+    def schedule_handback(self):
+        if not self.handback:
+            return
+        if self.handback_task:
+            self.handback_task.cancel()
+        self.handback_task = asyncio.ensure_future(self._handback_later())
+
+    async def _handback_later(self):
+        try:
+            await asyncio.sleep(HANDBACK_DELAY)
+        except asyncio.CancelledError:
+            return
+        self.handback_task = None
+        handback = self.handback
+        if not handback or self.state != "idle" or self.pending or self.queued or self.takeover_task:
+            return
+        term = handback["term"]
+        if not await terminal_at_shell(term):
+            log("claude handback skipped: the pane is gone or busy", self.sid)
+            self.handback = None
+            self.touch(urgent=True)
+            return
+        await self.shutdown()
+        ok = await terminal_run(term, resume_command(handback["argv"], self.native_id))
+        log("claude handback", self.sid, term.get("via"), "ok" if ok else "failed")
+        self.handback = None
+        _open_cache[0] = 0
+        self.touch(urgent=True)
 
     async def ensure_process(self):
         if self.is_live():
@@ -959,6 +1365,7 @@ class ClaudeSession(Session):
             return
         code = proc.returncode
         log("claude exit", self.sid, code)
+        self.skip_transcript()
         for fut in self.ctl_waiters.values():
             if not fut.done():
                 fut.set_exception(OpError("agent_exited"))
@@ -1154,43 +1561,95 @@ class ClaudeSession(Session):
                 self.emit_item(item)
             self.set_state("running")
             return
+        self.skip_transcript()
         self.set_state("idle")
+        self.schedule_handback()
 
     # actions ---------------------------------------------------------
     async def send(self, text, images):
         await self.load()
-        busy = self.state == "running" or bool(self.pending)
         self.suggestion = None
+        if self.handback_task:
+            self.handback_task.cancel()
+            self.handback_task = None
+        if images:
+            content = [{"type": "image", "source": {"type": "base64", "media_type": img.get("mime", "image/png"),
+                                                    "data": img.get("data", "")}} for img in images]
+            if text:
+                content.append({"type": "text", "text": text})
+        else:
+            content = text
+        if self.takeover_task or self.foreign_terminal(claude_open_sessions(max_age=0).get(self.native_id)):
+            item = {"id": new_id("u"), "kind": "user", "text": text, "images": len(images or []), "queued": True}
+            self.put(item)
+            self.takeover_queue.append((item, content))
+            if not self.takeover_task:
+                self.takeover_task = asyncio.ensure_future(self._take_over_and_send())
+            self.mark_started(text)
+            return {"id": item["id"]}
+        busy = self.state == "running" or bool(self.pending)
         item = {"id": new_id("u"), "kind": "user", "text": text, "images": len(images or []), "queued": busy}
         self.put(item)
         if busy:
             self.queued.append(item["id"])
         try:
             await self.ensure_process()
-            if images:
-                content = [{"type": "image", "source": {"type": "base64", "media_type": img.get("mime", "image/png"),
-                                                        "data": img.get("data", "")}} for img in images]
-                if text:
-                    content.append({"type": "text", "text": text})
-            else:
-                content = text
             await self.write({"type": "user", "message": {"role": "user", "content": content}})
         except OpError as e:
             item["failed"] = True
             self.emit_item(item)
             self.notice("send_failed", e.message)
             raise
+        self.mark_started(text)
+        if not busy:
+            self.set_state("running")
+        return {"id": item["id"]}
+
+    def mark_started(self, text):
         if not self.meta.get("started"):
             self.meta["started"] = True
         if not self.meta.get("title"):
             self.meta["title"] = one_line(text, 60)
         self.adopt()
         self.save()
-        if not busy:
-            self.set_state("running")
-        return {"id": item["id"]}
+
+    async def _take_over_and_send(self):
+        try:
+            await self.take_over()
+            if self.is_live():
+                # Our own process missed what the terminal added; start it afresh.
+                await self.shutdown()
+            await self.ensure_process()
+            first = True
+            while self.takeover_queue:
+                item, content = self.takeover_queue[0]
+                await self.write({"type": "user", "message": {"role": "user", "content": content}})
+                self.takeover_queue.pop(0)
+                if first:
+                    item["queued"] = False
+                    self.emit_item(item)
+                    self.set_state("running")
+                    first = False
+                else:
+                    self.queued.append(item["id"])
+        except OpError as e:
+            for item, _ in self.takeover_queue:
+                item["failed"] = True
+                item["queued"] = False
+                self.emit_item(item)
+            self.takeover_queue = []
+            self.notice("send_failed", e.message)
+        finally:
+            self.takeover_task = None
+            self.touch(urgent=True)
 
     async def interrupt(self):
+        entry = self.foreign_terminal(claude_open_sessions(max_age=0).get(self.native_id))
+        if entry and not self.is_live():
+            term = terminal_of(entry["pid"])
+            if term["via"] in ("herdr", "tmux") and await terminal_keys(term, "escape"):
+                return {}
+            raise OpError("in_terminal", "这个会话正在电脑终端里跑，手机上停不了")
         if not self.is_live():
             return {}
         self.interrupted = True
@@ -1295,10 +1754,121 @@ CODEX_SANDBOX_MODE = {"untrusted": "workspace-write", "auto": "workspace-write",
                       "full": "danger-full-access"}
 
 
+def ws_mask(key: bytes, data: bytes) -> bytes:
+    if not data:
+        return data
+    pad = (key * (len(data) // 4 + 1))[:len(data)]
+    return (int.from_bytes(data, "big") ^ int.from_bytes(pad, "big")).to_bytes(len(data), "big")
+
+
+def ws_frame(opcode: int, payload: bytes, mask=True) -> bytes:
+    """One final WebSocket frame. Clients must mask what they send."""
+    n = len(payload)
+    bit = 0x80 if mask else 0
+    head = bytes([0x80 | opcode])
+    if n < 126:
+        head += bytes([bit | n])
+    elif n < 65536:
+        head += bytes([bit | 126]) + struct.pack(">H", n)
+    else:
+        head += bytes([bit | 127]) + struct.pack(">Q", n)
+    if not mask:
+        return head + payload
+    key = os.urandom(4)
+    return head + key + ws_mask(key, payload)
+
+
+class WSConn:
+    """A small WebSocket client over a Unix socket: enough for Codex's
+    app-server control socket, which speaks JSON-RPC in text messages."""
+
+    def __init__(self, reader, writer):
+        self.reader = reader
+        self.writer = writer
+        self.closed = False
+
+    @classmethod
+    async def open_unix(cls, path, timeout=10):
+        reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(path), timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        writer.write(("GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                      "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n" % key).encode())
+        await writer.drain()
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout)
+        if b" 101 " not in head.split(b"\r\n", 1)[0]:
+            writer.close()
+            raise OSError("websocket upgrade refused: " + head.split(b"\r\n", 1)[0].decode("latin-1"))
+        return cls(reader, writer)
+
+    async def send(self, text: str):
+        if self.closed:
+            raise OpError("agent_not_running")
+        self.writer.write(ws_frame(1, text.encode("utf-8")))
+        await self.writer.drain()
+
+    async def recv(self):
+        """The next text message, or None once the connection is gone."""
+        parts = []
+        while True:
+            try:
+                b0, b1 = await self.reader.readexactly(2)
+                n = b1 & 0x7F
+                if n == 126:
+                    n = struct.unpack(">H", await self.reader.readexactly(2))[0]
+                elif n == 127:
+                    n = struct.unpack(">Q", await self.reader.readexactly(8))[0]
+                key = await self.reader.readexactly(4) if b1 & 0x80 else None
+                payload = await self.reader.readexactly(n) if n else b""
+            except (asyncio.IncompleteReadError, ConnectionError, OSError):
+                self.closed = True
+                return None
+            if key:
+                payload = ws_mask(key, payload)
+            op = b0 & 0x0F
+            if op == 8:
+                self.closed = True
+                return None
+            if op == 9:
+                self.writer.write(ws_frame(10, payload))
+                continue
+            if op == 10:
+                continue
+            parts.append(payload)
+            if b0 & 0x80:
+                return b"".join(parts).decode("utf-8", "replace")
+
+    def close(self):
+        self.closed = True
+        try:
+            self.writer.close()
+        except Exception:
+            pass
+
+
+async def run_capture(args, timeout=30):
+    """Runs a short command; returns (exit code, stdout text)."""
+    proc = await asyncio.create_subprocess_exec(*args, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                                                stderr=asyncio.subprocess.DEVNULL)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return -1, ""
+    return proc.returncode, out.decode("utf-8", "replace")
+
+
 class CodexBackend:
+    """One JSON-RPC connection to Codex's app-server. Prefers the shared
+    app-server daemon (the one `codex` in a terminal also joins), so a thread
+    open in a terminal and in Steer is one live thread; falls back to a private
+    `codex app-server` child when the daemon is unavailable."""
+
     def __init__(self, hub):
         self.hub = hub
         self.proc = None
+        self.ws = None
+        self.via = None
         self.next_id = 0
         self.waiters = {}
         self.generation = 0
@@ -1306,6 +1876,8 @@ class CodexBackend:
         self.models = None
 
     def alive(self):
+        if self.ws is not None:
+            return not self.ws.closed
         return self.proc is not None and self.proc.returncode is None
 
     async def ensure(self):
@@ -1315,16 +1887,44 @@ class CodexBackend:
             codex = find_bin("codex")
             if not codex:
                 raise OpError("agent_missing", "codex not found on PATH")
-            log("codex app-server start")
-            self.proc = await asyncio.create_subprocess_exec(
-                codex, "app-server", cwd=HOME, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE, limit=LINE_LIMIT)
+            ws = await self._open_daemon(codex) if os.environ.get("STEER_CODEX_DAEMON", "1") != "0" else None
             self.generation += 1
-            proc = self.proc
-            asyncio.ensure_future(self._read(proc))
-            asyncio.ensure_future(self._drain_stderr(proc))
+            if ws is not None:
+                log("codex: using the shared app-server daemon")
+                self.ws, self.proc, self.via = ws, None, "daemon"
+                asyncio.ensure_future(self._read_ws(ws))
+            else:
+                log("codex app-server start")
+                self.ws, self.via = None, "stdio"
+                self.proc = await asyncio.create_subprocess_exec(
+                    codex, "app-server", cwd=HOME, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE, limit=LINE_LIMIT)
+                proc = self.proc
+                asyncio.ensure_future(self._read(proc))
+                asyncio.ensure_future(self._drain_stderr(proc))
             await self._request("initialize", {"clientInfo": {"name": "steer", "title": "Steer", "version": VERSION}})
             await self._send({"method": "initialized"})
+
+    async def _daemon_info(self, codex):
+        code, out = await run_capture([codex, "app-server", "daemon", "version"], 20)
+        try:
+            return json.loads(out) if code == 0 else {}
+        except ValueError:
+            return {}
+
+    async def _open_daemon(self, codex):
+        try:
+            info = await self._daemon_info(codex)
+            if info.get("status") != "running":
+                await run_capture([codex, "app-server", "daemon", "start"], 60)
+                info = await self._daemon_info(codex)
+            path = info.get("socketPath")
+            if info.get("status") != "running" or not path:
+                return None
+            return await WSConn.open_unix(path)
+        except Exception as e:
+            log("codex daemon unavailable:", repr(e))
+            return None
 
     async def _drain_stderr(self, proc):
         while True:
@@ -1335,8 +1935,12 @@ class CodexBackend:
     async def _send(self, obj):
         if not self.alive():
             raise OpError("agent_not_running")
-        self.proc.stdin.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
-        await self.proc.stdin.drain()
+        data = json.dumps(obj, ensure_ascii=False)
+        if self.ws is not None:
+            await self.ws.send(data)
+        else:
+            self.proc.stdin.write((data + "\n").encode("utf-8"))
+            await self.proc.stdin.drain()
 
     async def _request(self, method, params, timeout=90):
         self.next_id += 1
@@ -1358,6 +1962,12 @@ class CodexBackend:
     async def respond(self, rid, result):
         await self._send({"id": rid, "result": result})
 
+    def _dispatch(self, m):
+        try:
+            self.on_message(m)
+        except Exception as e:
+            log("codex message error", repr(e))
+
     async def _read(self, proc):
         try:
             while True:
@@ -1368,22 +1978,50 @@ class CodexBackend:
                     m = json.loads(line)
                 except Exception:
                     continue
-                try:
-                    self.on_message(m)
-                except Exception as e:
-                    log("codex message error", repr(e))
+                self._dispatch(m)
         finally:
             await proc.wait()
             log("codex app-server exit", proc.returncode)
             if proc is self.proc:
                 self.proc = None
-                for fut in self.waiters.values():
-                    if not fut.done():
-                        fut.set_exception(OpError("agent_exited"))
-                self.waiters = {}
-                for s in self.hub.sessions.values():
-                    if isinstance(s, CodexSession):
-                        s.on_backend_exit()
+                self._lost()
+
+    async def _read_ws(self, ws):
+        try:
+            while True:
+                text = await ws.recv()
+                if text is None:
+                    break
+                try:
+                    m = json.loads(text)
+                except Exception:
+                    continue
+                self._dispatch(m)
+        finally:
+            log("codex daemon connection closed")
+            if ws is self.ws:
+                self.ws = None
+                self._lost()
+
+    def _lost(self):
+        for fut in self.waiters.values():
+            if not fut.done():
+                fut.set_exception(OpError("agent_exited"))
+        self.waiters = {}
+        for sess in self.hub.sessions.values():
+            if isinstance(sess, CodexSession):
+                sess.on_backend_exit()
+
+    async def close(self):
+        if self.ws is not None:
+            self.ws.close()
+            self.ws = None
+        elif self.alive():
+            try:
+                self.proc.stdin.close()
+                await asyncio.wait_for(self.proc.wait(), 5)
+            except Exception:
+                self.proc.terminate()
 
     def on_message(self, m):
         if "method" not in m:
@@ -1422,6 +2060,12 @@ class CodexSession(Session):
         b = self.hub.codex
         return b.alive() and self.generation == b.generation
 
+    def holds_helper(self) -> bool:
+        # On the shared daemon a running turn carries on without us.
+        if self.hub.codex.via == "daemon":
+            return bool(self.pending)
+        return super().holds_helper()
+
     async def load(self):
         if self.loaded:
             return
@@ -1458,6 +2102,14 @@ class CodexSession(Session):
             if item.get("kind") == "assistant" and (item.get("text") or "").strip():
                 self.last_text = one_line(item["text"], 160)
                 break
+        if self.hub.codex.via == "daemon":
+            # Follow the thread live: a terminal on the same daemon may be driving it.
+            try:
+                await self.ensure_thread()
+            except OpError as e:
+                log("codex follow failed", self.sid, e.message)
+            if self.turn_id and self.state != "running":
+                self.set_state("running")
 
     def policy(self):
         mode = self.meta.get("mode") or "auto"
@@ -1475,15 +2127,13 @@ class CodexSession(Session):
         return thread["id"]
 
     async def ensure_thread(self):
+        """Loads and subscribes to the thread. On the shared daemon another
+        client (a terminal) may have it open too, so this sets nothing: the
+        policy, model and sandbox travel with each turn/start instead."""
         if self.is_live():
             return
         await self.hub.codex.ensure()
-        approval, _ = self.policy()
-        params = {"threadId": self.sid, "excludeTurns": True, "approvalPolicy": approval,
-                  "sandbox": CODEX_SANDBOX_MODE.get(self.meta.get("mode") or "auto", "workspace-write")}
-        if self.meta.get("model"):
-            params["model"] = self.meta["model"]
-        await self.hub.codex.request("thread/resume", params)
+        await self.hub.codex.request("thread/resume", {"threadId": self.sid, "excludeTurns": True})
         self.generation = self.hub.codex.generation
 
     def on_backend_exit(self):
@@ -1843,6 +2493,7 @@ class Hub:
         self.codex_skills = {}    # cwd -> (time, skills)
         self.probe_locks = {}
         self._claude_help = (0, "")
+        self.caffeinate = None
         self.agent_versions = {}
         self.stopping = asyncio.Event()
 
@@ -2072,13 +2723,16 @@ class Hub:
         except Exception as e:
             log("claude history failed", repr(e))
             history = []
+        open_now = claude_open_sessions()
         for h in history:
             if h["sid"] in out or h["sid"] in hidden:
                 continue
-            out[h["sid"]] = {"sid": h["sid"], "agent": "claude", "cwd": h["cwd"], "title": h["title"], "state": "idle",
+            entry = open_now.get(h["sid"])
+            out[h["sid"]] = {"sid": h["sid"], "agent": "claude", "cwd": h["cwd"], "title": h["title"],
+                             "state": "running" if entry and entry["status"] not in TERMINAL_IDLE else "idle",
                              "needs": None, "lastText": h["lastText"], "activity": None, "updatedAt": h["updatedAt"],
                              "runningSince": None, "model": None, "mode": None, "source": "desktop", "live": False,
-                             "error": None}
+                             "error": None, "openInTerminal": bool(entry)}
         if find_bin("codex"):
             try:
                 r = await self.codex.request("thread/list", {"limit": 50, "sortKey": "updated_at",
@@ -2274,7 +2928,7 @@ class Hub:
         return {"t": now_ms()}
 
     async def op_shutdown(self, client, req):
-        busy = [s.sid for s in self.sessions.values() if s.state == "running" or s.pending]
+        busy = [s.sid for s in self.sessions.values() if s.holds_helper()]
         if busy and not req.get("force"):
             raise OpError("busy", "sessions are running: " + ", ".join(busy))
         asyncio.get_event_loop().call_later(0.2, self.stopping.set)
@@ -2305,6 +2959,60 @@ class Hub:
             except Exception:
                 pass
 
+    async def watch_terminals(self):
+        """Once a second: follow Claude sessions a terminal has open (state and
+        new transcript lines), and keep the computer awake while work runs."""
+        while not self.stopping.is_set():
+            await asyncio.sleep(1)
+            try:
+                open_now = claude_open_sessions(max_age=0.9)
+                for sid, entry in open_now.items():
+                    if sid not in self.sessions:
+                        self.adopt_terminal_session(sid, entry)
+                for sess in list(self.sessions.values()):
+                    if isinstance(sess, ClaudeSession):
+                        sess.follow_terminal(open_now.get(sess.native_id))
+            except Exception as e:
+                log("terminal watch", repr(e))
+            self.update_awake()
+
+    def adopt_terminal_session(self, sid, entry):
+        path = claude_transcript_path(sid, entry.get("cwd"))
+        if not path:
+            return  # nothing said yet
+        try:
+            info = claude_history_entry(path) or {}
+        except Exception:
+            info = {}
+        meta = {"sid": sid, "agent": "claude", "cwd": entry.get("cwd") or info.get("cwd") or HOME,
+                "title": info.get("title") or "", "lastText": info.get("lastText") or "", "source": "desktop",
+                "started": True, "persist": False}
+        self.add_session(meta)
+
+    def update_awake(self):
+        """`caffeinate` while any session runs or waits for an answer, so the
+        computer does not fall asleep under it."""
+        if sys.platform != "darwin":
+            return
+        busy = any(sess.state == "running" or sess.pending for sess in self.sessions.values())
+        if self.caffeinate is not None and self.caffeinate.poll() is not None:
+            self.caffeinate = None
+        if busy and self.caffeinate is None:
+            path = shutil.which("caffeinate") or "/usr/bin/caffeinate"
+            if os.path.exists(path):
+                self.caffeinate = subprocess.Popen([path, "-i", "-s", "-w", str(os.getpid())],
+                                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                                   stderr=subprocess.DEVNULL)
+                log("keeping the computer awake")
+        elif not busy and self.caffeinate is not None:
+            self.caffeinate.terminate()
+            try:
+                self.caffeinate.wait(2)
+            except subprocess.TimeoutExpired:
+                pass
+            self.caffeinate = None
+            log("the computer may sleep again")
+
     async def janitor(self):
         while not self.stopping.is_set():
             await asyncio.sleep(60)
@@ -2323,12 +3031,7 @@ class Hub:
                 await s.shutdown()
             except Exception:
                 pass
-        if self.codex.alive():
-            try:
-                self.codex.proc.stdin.close()
-                await asyncio.wait_for(self.codex.proc.wait(), 5)
-            except Exception:
-                self.codex.proc.terminate()
+        await self.codex.close()
 
 
 async def serve_main():
@@ -2351,9 +3054,13 @@ async def serve_main():
         except NotImplementedError:
             pass
     janitor = asyncio.ensure_future(hub.janitor())
+    watcher = asyncio.ensure_future(hub.watch_terminals())
     await hub.stopping.wait()
     log("stopping")
     janitor.cancel()
+    watcher.cancel()
+    if hub.caffeinate is not None:
+        hub.caffeinate.terminate()
     server.close()
     await hub.shutdown_all()
     try:

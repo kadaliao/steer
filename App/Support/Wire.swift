@@ -23,8 +23,29 @@ struct SessionSummary: Codable, Sendable, Identifiable, Equatable, Hashable {
     var suggestion: String?
     /// Claude only: a terminal on the host has this session open right now.
     var openInTerminal: Bool?
+    /// Where that terminal is: `herdr`, `tmux` or `shell`, and its status.
+    var terminal: TerminalInfo?
+    /// After Steer took the session over from a herdr/tmux pane, it reopens
+    /// it there once the phone is done (`herdr` / `tmux`).
+    var handback: String?
 
     var id: String { sid }
+
+    struct TerminalInfo: Codable, Sendable, Equatable, Hashable {
+        var via: String?
+        var status: String?
+
+        /// herdr and tmux panes get the session back automatically.
+        var canHandBack: Bool { via == "herdr" || via == "tmux" }
+        var isBusy: Bool { !["idle", "done", ""].contains(status ?? "") }
+        var place: String {
+            switch via {
+            case "herdr": String(localized: "herdr 窗格")
+            case "tmux": String(localized: "tmux 窗格")
+            default: String(localized: "终端")
+            }
+        }
+    }
 
     struct Activity: Codable, Sendable, Equatable, Hashable {
         var category: String?

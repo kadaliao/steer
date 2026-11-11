@@ -167,8 +167,13 @@ struct ChatView: View {
             }
             intentBanner
             if chat.summary.openInTerminal == true {
-                Label("电脑的终端里正开着这个会话。手机上发的内容那边不会自动出现：回到电脑后先在终端里退出，再 resume 才能看到；在旧窗口里接着打字会让记录分叉。", systemImage: "terminal")
-                    .font(.caption).foregroundStyle(.orange)
+                Label(terminalNote, systemImage: "terminal")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 6)
+            } else if let place = chat.summary.handback {
+                Label(String(localized: "手机这边做完、空闲一分钟后，会自动放回电脑上的 \(place) 窗格。"), systemImage: "arrow.uturn.backward")
+                    .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 6)
             } else if desktopMayBeOpen {
@@ -199,6 +204,19 @@ struct ChatView: View {
         .padding(.top, 6)
         .padding(.bottom, 6)
         .background(.bar)
+    }
+
+    /// What sending does to a session a terminal has open.
+    private var terminalNote: String {
+        let terminal = chat.summary.terminal
+        let place = terminal?.place ?? String(localized: "终端")
+        var note = terminal?.canHandBack == true
+            ? String(localized: "电脑上的\(place)里正开着这个会话，这里实时同步。在手机上发消息会先关掉那边的 Claude，由手机接着跑，做完后自动放回原窗格。")
+            : String(localized: "电脑终端里正开着这个会话，这里实时同步。在手机上发消息会先结束终端里的 Claude，回到电脑后用 claude -c 接着。")
+        if terminal?.isBusy == true {
+            note += String(localized: "它正在跑，你发的消息会等这一步做完。")
+        }
+        return note
     }
 
     private var desktopMayBeOpen: Bool {

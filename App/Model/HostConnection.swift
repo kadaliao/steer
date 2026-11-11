@@ -32,6 +32,7 @@ final class HostConnection: Identifiable {
     @ObservationIgnored private var link: HelperLink?
     @ObservationIgnored private var linkTasks: [Task<Void, Never>] = []
     @ObservationIgnored private var reconnectTask: Task<Void, Never>?
+    @ObservationIgnored private var upgradeTask: Task<Void, Never>?
     @ObservationIgnored private weak var app: AppModel?
 
     nonisolated let id: UUID
@@ -80,6 +81,9 @@ final class HostConnection: Identifiable {
             self.hello = hello
             status = .connected
             listen(to: link)
+            if HelperLink.isVersion(hello.helper, olderThan: script.version) {
+                upgradeWhenIdle()
+            }
             await refreshSessions(watch: true)
             for chat in chats.values where chat.isVisible {
                 await chat.load()
@@ -103,6 +107,7 @@ final class HostConnection: Identifiable {
 
     func disconnect() {
         reconnectTask?.cancel()
+        upgradeTask?.cancel()
         for task in linkTasks { task.cancel() }
         linkTasks = []
         if let link {
@@ -132,6 +137,23 @@ final class HostConnection: Identifiable {
                 }
             },
         ]
+    }
+
+    /// The helper running on the host is older than the one this app
+    /// installed: it was busy when the new one arrived, so it stayed. Ask it
+    /// to step down whenever nothing is running (it refuses while busy); the
+    /// reconnect then starts the new one.
+    private func upgradeWhenIdle() {
+        upgradeTask?.cancel()
+        upgradeTask = Task { [weak self] in
+            var first = true
+            while !Task.isCancelled {
+                if !first { try? await Task.sleep(for: .seconds(30)) }
+                first = false
+                guard let self, self.isConnected, !Task.isCancelled else { return }
+                if (try? await self.call("shutdown", timeout: .seconds(10)) as Empty) != nil { return }
+            }
+        }
     }
 
     private func linkClosed(_ closed: HelperLink, reason: String) {

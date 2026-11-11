@@ -57,14 +57,56 @@ appends to an assistant item's `text`.
 
 `sid, agent, cwd, title, state (idle|running|waiting), needs (permission|question|plan|null),
 lastText, activity{category,target}, updatedAt (ms), runningSince (ms), model, mode,
-source (steer|desktop), live, error, suggestion, openInTerminal`
+source (steer|desktop), live, error, suggestion, openInTerminal, terminal{via,status}, handback`
 
 - `suggestion`: Claude's predicted next user message (`--prompt-suggestions`),
   present only while the session is idle; cleared when a turn starts.
 - `openInTerminal` (Claude only): a terminal on the host has this session open
   right now, per Claude Code's registry `~/.claude/sessions/<pid>.json`
-  (`kind: interactive`, live pid). That process does not see what Steer adds
-  to the transcript until it is resumed again.
+  (`kind: interactive`, `entrypoint: cli`, live pid). `terminal.via` is
+  `herdr`, `tmux` or `shell` (the pane whose shell is the nearest ancestor of
+  that process); `terminal.status` is the registry's (`idle`, `working`, …).
+- `handback` (Claude only): Steer took the session over from that pane and
+  will reopen it there (`herdr` / `tmux`).
+
+## Sessions open in a terminal
+
+**Codex** needs nothing special: the helper joins Codex's shared app-server
+daemon (`codex app-server daemon version` → `socketPath`, a WebSocket over a
+Unix socket; started with `daemon start` when needed), which `codex` in a
+terminal also uses. A thread open in both is one live thread: each side sees
+the other's turns as they stream, and an approval request reaches both (the
+first answer wins; the other side gets `serverRequest/resolved`). Opening a
+session subscribes with a bare `thread/resume`; policy, model and sandbox
+travel with each `turn/start`. Without the daemon the helper falls back to a
+private `codex app-server` child (`STEER_CODEX_DAEMON=0` forces that).
+
+**Claude** has no second-client protocol, so one process owns a session at a
+time:
+
+- *Following*: while a terminal has the session open, the helper tails its
+  transcript (new lines become `item` events) and mirrors the registry
+  status as `state`. Every Claude session a terminal has open is listed.
+- *Taking over*: `session.send` returns at once with a queued user item; the
+  helper waits until the terminal is idle, closes it there (Ctrl+C in a herdr
+  or tmux pane, SIGTERM in a plain shell), restarts its own process with
+  `--resume` and sends.
+- *Handing back*: once the phone's turn is done and the session has been idle
+  for `STEER_HANDBACK_DELAY` seconds (60), the helper stops its process and
+  types `claude <the terminal's own flags> --resume <id>` into the original
+  pane, if that pane is still at its shell prompt.
+- `session.interrupt` on a session a herdr/tmux pane is running sends Escape
+  there.
+
+## Housekeeping
+
+- While any session runs or waits for an answer, the helper holds
+  `caffeinate -i -s` so the Mac does not go to sleep under it.
+- `shutdown` (and so `steerd.py stop`) refuses only while the helper itself
+  holds work: its own running Claude process, pending requests, a takeover or
+  handback, or Codex turns on a private app-server. The app installs a newer
+  `steerd.py` whenever it connects; when the old daemon was busy it keeps
+  asking it to step down every 30 s and reconnects to the new one.
 
 ### Timeline items
 
