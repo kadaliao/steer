@@ -5,3 +5,4 @@ xcuserdata/
 .DS_Store
 __pycache__/
 .swiftpm/
+build/

@@ -19,6 +19,7 @@
 		60A907D6E745CD578C1248C0 /* HeelerSSH in Frameworks */ = {isa = PBXBuildFile; productRef = C150A1B30000132CA999BCB7 /* HeelerSSH */; };
 		761DD389B03A3F8ECAE381AC /* PlainPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 900F3C93CC7860EC46CCDF6B /* PlainPreview.swift */; };
 		84FFFCE0D9CB40AE6E79E520 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = EF2F38CD51D287797FB0C7EC /* Assets.xcassets */; };
+		8BF7300CBFB37E88B750631C /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = ED804AE3F5C80A9801CA88EB /* PrivacyInfo.xcprivacy */; };
 		9027E814685D8C1511A48B15 /* Wire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98E62C0DEE7E6B6956DB0118 /* Wire.swift */; };
 		B5CE8415375C1F468282728A /* Keys.swift in Sources */ = {isa = PBXBuildFile; fileRef = F33ED03F8D383E1408A15FF1 /* Keys.swift */; };
 		BD5D681DA5A68274B77FB352 /* steerd.py in Resources */ = {isa = PBXBuildFile; fileRef = 49C85781100733FFE3120593 /* steerd.py */; };
@@ -79,6 +80,7 @@
 		C2C3AAA715AC30C47F00B24E /* SessionListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionListView.swift; sourceTree = "<group>"; };
 		D8063355C0850C59D2F7C8B4 /* MarkdownText.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownText.swift; sourceTree = "<group>"; };
 		D8651F060FD03E2D32AF3D6F /* DiffView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiffView.swift; sourceTree = "<group>"; };
+		ED804AE3F5C80A9801CA88EB /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		EF2F38CD51D287797FB0C7EC /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		F33ED03F8D383E1408A15FF1 /* Keys.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Keys.swift; sourceTree = "<group>"; };
 		FDD9F5779EBF460D2921B4EA /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
@@ -102,6 +104,7 @@
 			children = (
 				EF2F38CD51D287797FB0C7EC /* Assets.xcassets */,
 				FDD9F5779EBF460D2921B4EA /* Info.plist */,
+				ED804AE3F5C80A9801CA88EB /* PrivacyInfo.xcprivacy */,
 				AB4DBB998503A23F436C375C /* SteerApp.swift */,
 				765897AAF9346DF15EF4856D /* Model */,
 				C211DE0CE1D195407D362FAD /* Support */,
@@ -274,13 +277,16 @@
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
 					1FC088143E521F20399BCDB7 = {
+						DevelopmentTeam = HMDAVG9B8J;
 						ProvisioningStyle = Automatic;
 						TestTargetID = 5A68072841FAE356516E8D17;
 					};
 					5A68072841FAE356516E8D17 = {
+						DevelopmentTeam = HMDAVG9B8J;
 						ProvisioningStyle = Automatic;
 					};
 					5FBF6A8827937D4B28B6671A = {
+						DevelopmentTeam = HMDAVG9B8J;
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -315,6 +321,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				84FFFCE0D9CB40AE6E79E520 /* Assets.xcassets in Resources */,
+				8BF7300CBFB37E88B750631C /* PrivacyInfo.xcprivacy in Resources */,
 				BD5D681DA5A68274B77FB352 /* steerd.py in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -436,6 +443,7 @@
 				COPY_PHASE_STRIP = NO;
 				CURRENT_PROJECT_VERSION = 1;
 				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = HMDAVG9B8J;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -504,6 +512,7 @@
 				COPY_PHASE_STRIP = NO;
 				CURRENT_PROJECT_VERSION = 1;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = HMDAVG9B8J;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
