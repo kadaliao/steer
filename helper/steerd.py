@@ -35,7 +35,7 @@ import sys
 import time
 import uuid
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 PROTO = 1
 
 HOME = os.path.expanduser("~")
@@ -1126,6 +1126,7 @@ class ClaudeSession(Session):
         self.stream_items = {}
         self.queued = []
         self.reader_task = None
+        self.closing = False        # stdin closed; the process is on its way out
         # Following the session while a terminal has it open.
         self.transcript = None
         self.transcript_path = None
@@ -1141,7 +1142,7 @@ class ClaudeSession(Session):
         return self.meta.get("nativeId") or self.sid
 
     def is_live(self):
-        return self.proc is not None and self.proc.returncode is None
+        return self.proc is not None and self.proc.returncode is None and not self.closing
 
     def holds_helper(self) -> bool:
         return super().holds_helper() or bool(self.queued or self.takeover_task or self.handback)
@@ -1323,6 +1324,19 @@ class ClaudeSession(Session):
     async def ensure_process(self):
         if self.is_live():
             return
+        old = self.proc
+        if old is not None and old.returncode is None:
+            # Being reaped: let it finish before starting the next one.
+            try:
+                await asyncio.wait_for(old.wait(), 10)
+            except asyncio.TimeoutError:
+                old.terminate()
+                await old.wait()
+            if self.reader_task:
+                try:
+                    await asyncio.wait_for(asyncio.shield(self.reader_task), 5)
+                except Exception:
+                    pass
         claude = find_bin("claude")
         if not claude:
             raise OpError("agent_missing", "claude not found on PATH")
@@ -1342,7 +1356,7 @@ class ClaudeSession(Session):
             args += ["--prompt-suggestions", "true"]
             init["promptSuggestions"] = True
         if not os.path.isdir(self.cwd):
-            raise OpError("cwd_missing", self.cwd)
+            raise OpError("cwd_missing", "这台电脑上没有这个文件夹：" + self.cwd)
         log("claude start", self.sid, " ".join(args[1:]))
         self.stderr_tail = []
         env = dict(os.environ)
@@ -1396,6 +1410,7 @@ class ClaudeSession(Session):
             return
         code = proc.returncode
         log("claude exit", self.sid, code)
+        self.closing = False
         self.skip_transcript()
         for fut in self.ctl_waiters.values():
             if not fut.done():
@@ -1420,8 +1435,12 @@ class ClaudeSession(Session):
         if not self.is_live():
             raise OpError("agent_not_running")
         data = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
-        self.proc.stdin.write(data)
-        await self.proc.stdin.drain()
+        try:
+            self.proc.stdin.write(data)
+            await self.proc.stdin.drain()
+        except (ConnectionError, BrokenPipeError, OSError):
+            self.closing = True
+            raise OpError("agent_not_running", "Claude 进程刚好退出了")
 
     async def control(self, request, timeout=30):
         rid = "steer-" + uuid.uuid4().hex[:10]
@@ -1627,8 +1646,15 @@ class ClaudeSession(Session):
         if busy:
             self.queued.append(item["id"])
         try:
-            await self.ensure_process()
-            await self.write({"type": "user", "message": {"role": "user", "content": content}})
+            for attempt in (1, 2):
+                try:
+                    await self.ensure_process()
+                    await self.write({"type": "user", "message": {"role": "user", "content": content}})
+                    break
+                except OpError as e:
+                    if e.code != "agent_not_running" or attempt == 2:
+                        raise
+                    log("claude went away mid-send; starting it again", self.sid)
         except OpError as e:
             item["failed"] = True
             self.emit_item(item)
@@ -1771,6 +1797,7 @@ class ClaudeSession(Session):
     def reap_if_idle(self):
         if self.is_live() and self.state == "idle" and not self.pending and time.time() - self.idle_since > CLAUDE_IDLE_EXIT:
             log("claude idle exit", self.sid)
+            self.closing = True
             try:
                 self.proc.stdin.close()
             except Exception:
@@ -2951,7 +2978,7 @@ class Hub:
         agent = req.get("agent")
         cwd = os.path.expanduser(req.get("cwd") or "~")
         if not os.path.isdir(cwd):
-            raise OpError("cwd_missing", cwd)
+            raise OpError("cwd_missing", "这台电脑上没有这个文件夹：" + cwd)
         meta = {"agent": agent, "cwd": cwd, "title": "", "source": "steer", "persist": True,
                 "createdAt": now_ms(), "mode": req.get("mode"), "model": req.get("model")}
         if agent == "claude":

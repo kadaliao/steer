@@ -98,6 +98,13 @@ struct WireTests {
         #expect(delta.itemId == "m:t0")
     }
 
+    @MainActor @Test func clearAndNewStartOver() {
+        #expect(ChatView.startsOver("/clear"))
+        #expect(ChatView.startsOver("/NEW"))
+        #expect(!ChatView.startsOver("/clear the cache please"))
+        #expect(!ChatView.startsOver("/compact"))
+    }
+
     @Test func upgradesTheHelperButNeverDowngrades() {
         #expect(HelperLink.isVersion("0.1.2", olderThan: "0.2.0"))
         #expect(HelperLink.isVersion("0.2", olderThan: "0.2.1"))

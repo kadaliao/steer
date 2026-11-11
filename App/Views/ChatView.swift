@@ -260,6 +260,11 @@ struct ChatView: View {
         let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let images = attachments
         guard !message.isEmpty || !images.isEmpty else { return }
+        if Self.startsOver(message), images.isEmpty, chat.intent == .message {
+            text = ""
+            Task { await startFresh() }
+            return
+        }
         text = ""
         attachments = []
         Task {
@@ -268,6 +273,27 @@ struct ChatView: View {
                 text = message
                 attachments = images
             }
+        }
+    }
+}
+
+extension ChatView {
+    /// `/clear` and `/new` start a new conversation, as in the CLI. Steer does
+    /// it as a new session in the same folder, so a terminal that has this one
+    /// open is left alone.
+    static func startsOver(_ message: String) -> Bool {
+        ["/clear", "/new", "/reset"].contains(message.lowercased())
+    }
+
+    func startFresh() async {
+        guard let conn = chat.conn else { return }
+        do {
+            let summary = try await conn.createSession(
+                agent: chat.agent, cwd: chat.summary.cwd, text: "", images: [],
+                model: chat.summary.model, mode: chat.summary.mode)
+            app.pendingRoute = .chat(conn.id, summary.sid)
+        } catch {
+            chat.actionError = error.localizedDescription
         }
     }
 }

@@ -233,6 +233,11 @@ final class HostConnection: Identifiable {
         try await call("push.test", timeout: .seconds(30))
     }
 
+    /// Whether a folder exists on this host.
+    func folderExists(_ path: String) async -> Bool {
+        (try? await call("dirs.list", ["path": .string(path)], timeout: .seconds(20)) as DirListing) != nil
+    }
+
     func loadProjects() async {
         if let list: ProjectList = try? await call("projects.recent", timeout: .seconds(45)) {
             projects = list.projects

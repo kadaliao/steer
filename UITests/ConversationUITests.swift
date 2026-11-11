@@ -150,6 +150,12 @@ final class ConversationUITests: XCTestCase {
                 app.buttons["完成"].firstMatch.tap()
             }
         }
+        // "/clear" starts a new, empty session in the same folder.
+        send("/clear")
+        let fresh = app.staticTexts["新会话"].firstMatch
+        XCTAssertTrue(fresh.waitForExistence(timeout: 20), "/clear did not open a new session")
+        XCTAssertFalse(app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'cube'")).firstMatch.exists)
+        shot("after-clear")
         app.navigationBars.buttons.element(boundBy: 0).tap()
         sleep(2)
         shot("list-after")

@@ -399,5 +399,41 @@ class PushTests(unittest.TestCase):
         self.assertFalse(s.phone_turn)
 
 
+class ReapRaceTests(unittest.TestCase):
+    def test_a_process_being_reaped_is_not_live(self):
+        s = steerd.ClaudeSession(FakeHub(), {"sid": "r1", "agent": "claude", "cwd": "/w"})
+
+        class Proc:
+            returncode = None
+            pid = 4242
+        s.proc = Proc()
+        self.assertTrue(s.is_live())
+        s.closing = True
+        self.assertFalse(s.is_live())
+
+    def test_writing_to_a_closed_pipe_says_the_process_is_gone(self):
+        s = steerd.ClaudeSession(FakeHub(), {"sid": "r2", "agent": "claude", "cwd": "/w"})
+
+        class Stdin:
+            def write(self, data):
+                raise ConnectionResetError("Connection lost")
+
+            async def drain(self):
+                pass
+
+        class Proc:
+            returncode = None
+            pid = 4243
+            stdin = Stdin()
+        s.proc = Proc()
+
+        async def run():
+            with self.assertRaises(steerd.OpError) as ctx:
+                await s.write({"type": "user"})
+            self.assertEqual(ctx.exception.code, "agent_not_running")
+            self.assertFalse(s.is_live())
+        asyncio.run(run()) if hasattr(asyncio, "run") else asyncio.get_event_loop().run_until_complete(run())
+
+
 if __name__ == "__main__":
     unittest.main()

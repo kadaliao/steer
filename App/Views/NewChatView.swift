@@ -141,15 +141,22 @@ struct NewChatView: View {
         Task { await prepareHost() }
     }
 
-    /// The host's last project (or its most recent one) and agent info.
+    /// The host's last project (or its most recent one) and agent info. A
+    /// remembered folder that this host does not have (it came from another
+    /// computer) is dropped.
     private func prepareHost() async {
         guard let conn else { return }
-        cwd = Prefs.lastProject(host: conn.id)
+        error = nil
+        var path = Prefs.lastProject(host: conn.id)
         info = await conn.info(for: agent)
-        if cwd == nil {
-            await conn.loadProjects()
-            cwd = conn.projects.first?.path
+        if let remembered = path, !(await conn.folderExists(remembered)) {
+            path = nil
         }
+        if path == nil {
+            await conn.loadProjects()
+            path = conn.projects.first?.path
+        }
+        cwd = path
     }
 
     private func create() {
