@@ -26,6 +26,13 @@ enum DebugLaunch {
                 app.saveHost(host, password: nil)
             }
         }
+        // A launch-argument project wins over what each host remembered, so a
+        // test never lands in a folder left over from an earlier run.
+        if arguments.contains("-lastProject") {
+            for key in UserDefaults.standard.dictionaryRepresentation().keys where key.hasPrefix("lastProject.") {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
         if arguments.contains("-steerPrintKey"), let key = try? app.deviceKey() {
             print("STEER_DEVICE_KEY " + key.authorizedKeysLine)
         }
