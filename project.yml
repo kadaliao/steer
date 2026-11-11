@@ -1,0 +1,86 @@
+name: Steer
+options:
+  bundleIdPrefix: com.kadaliao
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+  developmentLanguage: zh-Hans
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+packages:
+  HeelerSSH:
+    path: Packages/HeelerSSH
+targets:
+  Steer:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+      - path: helper/steerd.py
+        buildPhase: resources
+    dependencies:
+      - package: HeelerSSH
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Steer
+        CFBundleDevelopmentRegion: zh-Hans
+        CFBundleLocalizations: [zh-Hans]
+        UILaunchScreen: {}
+        UIApplicationSupportsIndirectInputEvents: true
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        NSLocalNetworkUsageDescription: Steer 通过 SSH 连接你局域网里的电脑。
+        NSPhotoLibraryUsageDescription: 选择截图或照片发给 agent。
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kadaliao.steer
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+  SteerTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: Steer
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.kadaliao.steer.tests
+  SteerUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: Steer
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.kadaliao.steer.uitests
+        TEST_TARGET_NAME: Steer
+schemes:
+  Steer:
+    build:
+      targets:
+        Steer: all
+        SteerTests: [test]
+    test:
+      targets:
+        - SteerTests
+  SteerUI:
+    build:
+      targets:
+        Steer: all
+        SteerUITests: [test]
+    test:
+      targets:
+        - SteerUITests
