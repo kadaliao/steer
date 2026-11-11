@@ -67,6 +67,7 @@ struct NewChatView: View {
                         ChipLabel(text: projectName, systemImage: "folder", prominent: cwd == nil)
                     }
                     .buttonStyle(.plain)
+                    .accessibilityIdentifier("projectChip")
                     Menu {
                         ForEach(Agents.all, id: \.self) { option in
                             Button {
@@ -192,20 +193,38 @@ struct ProjectPicker: View {
     let selected: String?
     let choose: (String) -> Void
     @State private var query = ""
+    @State private var checking = false
+    @State private var missing: String?
+    @State private var pathError: String?
 
     private var filtered: [ProjectEntry] {
         guard !query.isEmpty else { return conn.projects }
         return conn.projects.filter { $0.path.localizedCaseInsensitiveContains(query) }
     }
 
+    private var typedPath: Bool { query.hasPrefix("/") || query.hasPrefix("~") }
+
     var body: some View {
         NavigationStack {
             List {
-                if query.hasPrefix("/") || query.hasPrefix("~") {
-                    Button {
-                        pick(query)
-                    } label: {
-                        Label("使用 \(query)", systemImage: "arrow.right.circle")
+                if typedPath {
+                    Section {
+                        Button {
+                            usePath(query)
+                        } label: {
+                            HStack {
+                                Label("使用 \(query)", systemImage: "arrow.right.circle")
+                                if checking {
+                                    Spacer()
+                                    ProgressView()
+                                }
+                            }
+                        }
+                        .disabled(checking)
+                    } footer: {
+                        if let pathError {
+                            Text(pathError).foregroundStyle(.red)
+                        }
                     }
                 }
                 Section("最近") {
@@ -230,19 +249,31 @@ struct ProjectPicker: View {
                 }
                 Section {
                     NavigationLink {
-                        FolderBrowser(conn: conn, path: conn.hello?.home ?? "~") { path in pick(path) }
+                        FolderBrowser(conn: conn, path: conn.hello?.home ?? "~", canGoUp: true) { path in pick(path) }
                     } label: {
-                        Label("浏览文件夹…", systemImage: "folder.badge.plus")
+                        Label("浏览文件夹…", systemImage: "folder")
                     }
                 }
             }
             .searchable(text: $query, prompt: "搜索，或输入路径")
+            .onSubmit(of: .search) {
+                if typedPath { usePath(query) }
+            }
+            .onChange(of: query) { pathError = nil }
             .navigationTitle("选择项目")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("取消") { dismiss() }
                 }
+            }
+            .alert("新建文件夹？", isPresented: Binding(get: { missing != nil }, set: { if !$0 { missing = nil } })) {
+                Button("取消", role: .cancel) {}
+                Button("新建并使用") {
+                    if let missing { createMissing(missing) }
+                }
+            } message: {
+                Text("这台电脑上还没有 \(shortPath(missing ?? ""))。要新建它，用它开始会话吗？")
             }
             .task { await conn.loadProjects() }
         }
@@ -253,21 +284,62 @@ struct ProjectPicker: View {
     }
 
     private func pick(_ path: String) {
-        var path = path
-        if path.hasPrefix("~"), let home = conn.hello?.home {
-            path = home + path.dropFirst()
-        }
-        choose(path)
+        choose(conn.absolutePath(path))
         dismiss()
+    }
+
+    /// A typed path that exists is used; one that does not is offered as a
+    /// new folder, so a typo never makes one without asking.
+    private func usePath(_ typed: String) {
+        let path = conn.absolutePath(typed)
+        checking = true
+        pathError = nil
+        Task {
+            let exists = await conn.folderExists(path)
+            checking = false
+            if exists {
+                pick(path)
+            } else {
+                missing = path
+            }
+        }
+    }
+
+    private func createMissing(_ path: String) {
+        let parent = (path as NSString).deletingLastPathComponent
+        let name = (path as NSString).lastPathComponent
+        checking = true
+        Task {
+            do {
+                let made = try await conn.createFolder(in: parent, named: name)
+                checking = false
+                pick(made)
+            } catch {
+                checking = false
+                pathError = error.localizedDescription
+            }
+        }
     }
 }
 
+/// One folder's subfolders. "新建文件夹" makes a folder here and picks it
+/// right away: a new project starts empty, so there is nothing to browse into.
+/// The first level (home) can also climb to its parent; deeper levels go up
+/// with the back button.
 struct FolderBrowser: View {
     let conn: HostConnection
     let path: String
+    var canGoUp = false
     let choose: (String) -> Void
+    @State private var climbed: String?
     @State private var listing: DirListing?
     @State private var error: String?
+    @State private var naming = false
+    @State private var newName = ""
+    @State private var creating = false
+    @State private var createError: String?
+
+    private var shown: String { climbed ?? path }
 
     var body: some View {
         List {
@@ -278,8 +350,31 @@ struct FolderBrowser: View {
                     } label: {
                         Label("就用这个文件夹", systemImage: "checkmark.circle.fill")
                     }
+                    Button {
+                        startNaming()
+                    } label: {
+                        HStack {
+                            Label("在这里新建文件夹…", systemImage: "folder.badge.plus")
+                            if creating {
+                                Spacer()
+                                ProgressView()
+                            }
+                        }
+                    }
+                    .disabled(creating)
+                } footer: {
+                    if let createError {
+                        Text(createError).foregroundStyle(.red)
+                    }
                 }
                 Section {
+                    if canGoUp, let parent = listing.parent {
+                        Button {
+                            climb(to: parent)
+                        } label: {
+                            Label("上一级 · \(conn.shortPath(parent))", systemImage: "arrow.up")
+                        }
+                    }
                     ForEach(listing.entries) { entry in
                         NavigationLink {
                             FolderBrowser(conn: conn, path: entry.path, choose: choose)
@@ -294,13 +389,62 @@ struct FolderBrowser: View {
                 ProgressView()
             }
         }
-        .navigationTitle((path as NSString).lastPathComponent)
+        .navigationTitle(Self.title(listing?.path ?? shown))
         .navigationBarTitleDisplayMode(.inline)
-        .task {
+        .alert("新建文件夹", isPresented: $naming) {
+            TextField("文件夹名", text: $newName)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button("取消", role: .cancel) {}
+            Button("新建并使用") { create() }
+                .disabled(!Self.isValidName(newName))
+        } message: {
+            Text("在 \(conn.shortPath(listing?.path ?? shown)) 里新建，并用它开始会话。")
+        }
+        .task(id: shown) {
             do {
-                listing = try await conn.call("dirs.list", ["path": .string(path)])
+                listing = try await conn.call("dirs.list", ["path": .string(shown)])
+                error = nil
             } catch {
                 self.error = error.localizedDescription
+            }
+        }
+    }
+
+    static func title(_ path: String) -> String {
+        path == "/" ? "/" : (path as NSString).lastPathComponent
+    }
+
+    static func isValidName(_ name: String) -> Bool {
+        let name = name.trimmingCharacters(in: .whitespaces)
+        return !name.isEmpty && !name.contains("/") && name != "." && name != ".."
+    }
+
+    private func climb(to parent: String) {
+        listing = nil
+        createError = nil
+        climbed = parent
+    }
+
+    private func startNaming() {
+        newName = ""
+        createError = nil
+        naming = true
+    }
+
+    private func create() {
+        guard let parent = listing?.path, Self.isValidName(newName) else { return }
+        let name = newName.trimmingCharacters(in: .whitespaces)
+        creating = true
+        createError = nil
+        Task {
+            do {
+                let made = try await conn.createFolder(in: parent, named: name)
+                creating = false
+                choose(made)
+            } catch {
+                creating = false
+                createError = error.localizedDescription
             }
         }
     }

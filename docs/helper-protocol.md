@@ -32,6 +32,7 @@ process elsewhere) and relays stdin/stdout to its Unix socket
 | `session.archive` | `sid`, `agent`, `cwd`, `archived` | — |
 | `files.search` | `cwd`, `query`, `limit` | `files[]` (relative paths, fuzzy ranked) |
 | `dirs.list` | `path` | `path`, `parent`, `entries[{name, path, git}]`, `git` |
+| `dirs.create` | `path` (parent), `name` | `path` of the new folder; an existing folder of that name is returned as is. Errors `bad_name` (empty, `/`, `.`, `..`), `not_found`, `exists` (a file has the name) |
 | `projects.recent` | — | `projects[{path, name, updatedAt, agents, git}]` |
 | `agent.info` | `agent`, `cwd?` | `models[]`, `commands[]` (last known, any folder), `modes[]` |
 | `agent.commands` | `agent`, `cwd`, `reload?` | `commands[{name, description, argumentHint, kind (skill\|builtin)}]` for that folder: Claude's `initialize` list (a short-lived `claude -p` with hooks off, no message sent), Codex's `skills/list`. Cached 10 minutes |

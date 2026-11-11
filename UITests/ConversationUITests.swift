@@ -183,6 +183,99 @@ final class ConversationUITests: XCTestCase {
         app.buttons.matching(NSPredicate(format: "label BEGINSWITH '全部主机'")).firstMatch.tap()
     }
 
+    /// The folder browser makes a folder and the new chat picks it. Browsing
+    /// starts at home, so this needs a project folder under home; the new
+    /// folder goes inside it. Spends no usage.
+    func testNewFolder() throws {
+        let project = ProcessInfo.processInfo.environment["STEER_UI_PROJECT"] ?? ""
+        app.launch()
+        openNewChat()
+        let chip = app.buttons.matching(identifier: "projectChip").firstMatch
+        XCTAssertTrue(chip.waitForExistence(timeout: 30))
+        chip.tap()
+        app.buttons["浏览文件夹…"].tap()
+        let newFolder = app.buttons["在这里新建文件夹…"]
+        // Browsing starts at home: find it in the project path, then walk
+        // down. Folder lists load lazily, so scroll each row into view first.
+        let parts = project.split(separator: "/").map(String.init)
+        XCTAssertTrue(newFolder.waitForExistence(timeout: 20))
+        guard let home = parts.lastIndex(where: { app.navigationBars[$0].exists }) else {
+            throw XCTSkip("STEER_UI_PROJECT is not under the host's home folder")
+        }
+        for component in parts[(home + 1)...] {
+            let row = app.collectionViews.buttons[component].firstMatch
+            for _ in 0..<20 where !(row.exists && row.isHittable) { app.swipeUp() }
+            row.tap()
+            XCTAssertTrue(app.navigationBars[component].waitForExistence(timeout: 10))
+            XCTAssertTrue(newFolder.waitForExistence(timeout: 20))
+        }
+        newFolder.tap()
+        let name = "ui-folder-\(Int(Date().timeIntervalSince1970))"
+        let field = app.alerts.textFields.firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        field.typeText(name)
+        shot("naming")
+        app.alerts.buttons["新建并使用"].tap()
+        try waitPicked(name, chip: chip)
+    }
+
+    /// A typed path that does not exist is offered as a new folder.
+    func testTypedPathMakesFolder() throws {
+        let project = ProcessInfo.processInfo.environment["STEER_UI_PROJECT"] ?? ""
+        app.launch()
+        openNewChat()
+        let chip = app.buttons.matching(identifier: "projectChip").firstMatch
+        XCTAssertTrue(chip.waitForExistence(timeout: 30))
+        chip.tap()
+        let search = app.searchFields.firstMatch
+        XCTAssertTrue(search.waitForExistence(timeout: 10))
+        search.tap()
+        let name = "ui-typed-\(Int(Date().timeIntervalSince1970))"
+        search.typeText(project + "/" + name)
+        app.buttons.matching(NSPredicate(format: "label BEGINSWITH '使用 '")).firstMatch.tap()
+        let create = app.alerts.buttons["新建并使用"]
+        XCTAssertTrue(create.waitForExistence(timeout: 20), "missing folder was not offered")
+        shot("offer")
+        create.tap()
+        try waitPicked(name, chip: chip)
+    }
+
+    /// The folder browser starts at home and can climb above it.
+    func testBrowseAboveHome() throws {
+        app.launch()
+        openNewChat()
+        let chip = app.buttons.matching(identifier: "projectChip").firstMatch
+        XCTAssertTrue(chip.waitForExistence(timeout: 30))
+        chip.tap()
+        app.buttons["浏览文件夹…"].tap()
+        let up = app.buttons.matching(NSPredicate(format: "label BEGINSWITH '上一级'")).firstMatch
+        XCTAssertTrue(up.waitForExistence(timeout: 20))
+        up.tap()
+        // Home is two levels down on macOS and Linux (/Users/x, /home/x).
+        XCTAssertTrue(app.buttons["上一级 · /"].waitForExistence(timeout: 20))
+        shot("above-home")
+    }
+
+    /// The chip shows the new folder, or the test skips when the host still
+    /// runs an older helper without `dirs.create`.
+    private func waitPicked(_ name: String, chip: XCUIElement) throws {
+        let picked = NSPredicate(format: "label CONTAINS %@", name)
+        let old = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH '这台主机上的助手还是旧版本'")).firstMatch
+        let deadline = Date().addingTimeInterval(20)
+        while Date() < deadline {
+            if picked.evaluate(with: chip) {
+                shot("picked")
+                return
+            }
+            if old.exists {
+                shot("old-helper")
+                throw XCTSkip("the host is still running an older helper")
+            }
+            sleep(1)
+        }
+        XCTFail("new folder was not picked")
+    }
+
     func testCodexConversation() throws {
         app.launchArguments += ["-lastAgent", "codex"]
         app.launch()

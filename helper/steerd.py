@@ -35,7 +35,7 @@ import sys
 import time
 import uuid
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 PROTO = 1
 
 HOME = os.path.expanduser("~")
@@ -2524,6 +2524,26 @@ def list_dirs(path: str):
             "git": os.path.isdir(os.path.join(path, ".git"))}
 
 
+def make_dir(parent: str, name: str):
+    """Creates one folder `name` inside `parent`. A folder already there is
+    returned as is: the user wanted that folder, and now it exists."""
+    name = (name or "").strip()
+    if not name or "/" in name or "\0" in name or name in (".", ".."):
+        raise OpError("bad_name", "文件夹名不能为空，也不能包含 /")
+    parent = os.path.abspath(os.path.expanduser(parent or "~"))
+    if not os.path.isdir(parent):
+        raise OpError("not_found", "这台电脑上没有这个文件夹：" + parent)
+    full = os.path.join(parent, name)
+    try:
+        os.mkdir(full)
+    except FileExistsError:
+        if not os.path.isdir(full):
+            raise OpError("exists", "这里已经有一个同名文件：" + name)
+    except OSError as e:
+        raise OpError("mkdir_failed", "没能新建文件夹：" + (e.strerror or str(e)))
+    return {"path": full}
+
+
 # ---------------------------------------------------------------------------
 # Hub: clients, sessions, ops
 # ---------------------------------------------------------------------------
@@ -3059,6 +3079,9 @@ class Hub:
 
     async def op_dirs_list(self, client, req):
         return list_dirs(req.get("path") or "~")
+
+    async def op_dirs_create(self, client, req):
+        return make_dir(req.get("path") or "~", req.get("name") or "")
 
     async def op_projects_recent(self, client, req):
         listing = await self.op_sessions_list(client, req)

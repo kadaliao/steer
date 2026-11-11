@@ -238,6 +238,29 @@ final class HostConnection: Identifiable {
         (try? await call("dirs.list", ["path": .string(path)], timeout: .seconds(20)) as DirListing) != nil
     }
 
+    /// Makes folder `name` inside `parent` and returns its path; a folder
+    /// already there is returned as is.
+    func createFolder(in parent: String, named name: String) async throws -> String {
+        do {
+            let made: CreatedDir = try await call(
+                "dirs.create", ["path": .string(parent), "name": .string(name)], timeout: .seconds(20))
+            return made.path
+        } catch LinkError.remote(let code, _) where code == "unknown_op" {
+            throw LinkError.remote(
+                code: code, message: String(localized: "这台主机上的助手还是旧版本，正在跑的会话结束后会自动更新，到时再试一次。"))
+        }
+    }
+
+    /// `~` and `~/…` become absolute; trailing slashes go.
+    func absolutePath(_ path: String) -> String {
+        var path = path.trimmingCharacters(in: .whitespaces)
+        if path == "~" || path.hasPrefix("~/"), let home = hello?.home {
+            path = home + path.dropFirst()
+        }
+        while path.count > 1, path.hasSuffix("/") { path.removeLast() }
+        return path
+    }
+
     func loadProjects() async {
         if let list: ProjectList = try? await call("projects.recent", timeout: .seconds(45)) {
             projects = list.projects

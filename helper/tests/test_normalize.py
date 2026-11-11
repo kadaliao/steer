@@ -435,5 +435,42 @@ class ReapRaceTests(unittest.TestCase):
         asyncio.run(run()) if hasattr(asyncio, "run") else asyncio.get_event_loop().run_until_complete(run())
 
 
+
+class MakeDirTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.realpath(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_creates_the_folder_inside_the_parent(self):
+        result = steerd.make_dir(self.root, "  new-app ")
+        self.assertEqual(result["path"], os.path.join(self.root, "new-app"))
+        self.assertTrue(os.path.isdir(result["path"]))
+
+    def test_an_existing_folder_is_returned_as_is(self):
+        os.mkdir(os.path.join(self.root, "there"))
+        self.assertEqual(steerd.make_dir(self.root, "there")["path"], os.path.join(self.root, "there"))
+
+    def test_rejects_names_that_leave_the_parent(self):
+        for name in ["", "  ", "a/b", "..", "."]:
+            with self.assertRaises(steerd.OpError) as ctx:
+                steerd.make_dir(self.root, name)
+            self.assertEqual(ctx.exception.code, "bad_name", name)
+
+    def test_a_file_with_that_name_is_an_error(self):
+        open(os.path.join(self.root, "taken"), "w").close()
+        with self.assertRaises(steerd.OpError) as ctx:
+            steerd.make_dir(self.root, "taken")
+        self.assertEqual(ctx.exception.code, "exists")
+
+    def test_a_missing_parent_is_an_error(self):
+        with self.assertRaises(steerd.OpError) as ctx:
+            steerd.make_dir(os.path.join(self.root, "nope"), "x")
+        self.assertEqual(ctx.exception.code, "not_found")
+
+
 if __name__ == "__main__":
     unittest.main()

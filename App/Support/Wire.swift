@@ -191,6 +191,10 @@ struct DirListing: Decodable, Sendable {
     var git: Bool?
 }
 
+struct CreatedDir: Decodable, Sendable {
+    var path: String
+}
+
 struct ModelOption: Decodable, Sendable, Identifiable, Hashable {
     var id: String
     var name: String?
