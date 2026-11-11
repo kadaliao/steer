@@ -18,6 +18,20 @@ ASC_KEY_ID=… ASC_ISSUER_ID=… NOTES="这一版改了什么" scripts/testfligh
   TestFlight 就能装。
 - **加密合规**：Info.plist 里 `ITSAppUsesNonExemptEncryption` 为 `false`，上传后不用再答问卷。
 
+## 外部测试
+
+外部测试组「朋友」开着公开链接（https://testflight.apple.com/join/a3WDp4x2），2026-11-12 从 0.5.0 (6) 开始。
+测试信息（zh-Hans 描述、反馈邮箱）和 Beta App Review 的联系人、说明已经填好，没有演示账号：审核说明
+解释了 App 要连测试者自己的电脑。每个新构建处理完以后：
+
+```sh
+scripts/asc.sh POST /v1/betaGroups/<朋友组 ID>/relationships/builds '{"data":[{"type":"builds","id":"<构建 ID>"}]}'
+scripts/asc.sh POST /v1/betaAppReviewSubmissions '{"data":{"type":"betaAppReviewSubmissions","relationships":{"build":{"data":{"type":"builds","id":"<构建 ID>"}}}}}'
+```
+
+组 ID 用 `scripts/asc.sh GET /v1/apps/6833468787/betaGroups` 查。外部测试者看的是"测试内容"，要写清楚
+从他们上一个构建以来的所有变化。
+
 ## 第一次之前
 
 已经做过（2026-11-11），App 记录叫 Steer，App ID `6833468787`。要重做时：
