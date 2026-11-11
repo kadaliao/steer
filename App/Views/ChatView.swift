@@ -3,13 +3,18 @@ import SwiftUI
 /// Resolves a session id to its chat once the list knows about it.
 struct ChatScreen: View {
     @Environment(AppModel.self) private var app
+    let hostID: UUID
     let sid: String
 
     var body: some View {
-        if let chat = app.chat(sid: sid) {
-            ChatView(chat: chat)
+        if let conn = app.connection(hostID) {
+            if let chat = conn.chat(sid: sid) {
+                ChatView(chat: chat)
+            } else {
+                ProgressView().task { await conn.refreshSessions() }
+            }
         } else {
-            ProgressView().task { await app.refreshSessions() }
+            ContentUnavailableView("这台主机已经删除", systemImage: "desktopcomputer.trianglebadge.exclamationmark")
         }
     }
 }
@@ -58,6 +63,7 @@ struct ChatView: View {
         .defaultScrollAnchor(.bottom)
         .defaultScrollAnchor(.bottom, for: .sizeChanges)
         .scrollDismissesKeyboard(.interactively)
+        .simultaneousGesture(TapGesture().onEnded { focused = false })
         .safeAreaInset(edge: .bottom, spacing: 0) { dock }
         .toolbar {
             ToolbarItem(placement: .principal) { titleView }
@@ -68,7 +74,7 @@ struct ChatView: View {
             chat.isVisible = true
             text = Prefs.draft(chat.sid)
             await chat.load()
-            info = await app.info(for: chat.agent)
+            info = await chat.conn?.info(for: chat.agent)
         }
         .onChange(of: text) { _, value in Prefs.setDraft(value, chat.sid) }
         .onDisappear {
@@ -98,10 +104,16 @@ struct ChatView: View {
         VStack(spacing: 0) {
             Text(chat.summary.title.isEmpty ? String(localized: "新会话") : chat.summary.title)
                 .font(.subheadline.weight(.semibold)).lineLimit(1)
-            Text("\(chat.summary.projectName) · \(Agents.name(chat.agent))")
+            Text(subtitle)
                 .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
         }
         .frame(maxWidth: 240)
+    }
+
+    private var subtitle: String {
+        var parts = [chat.summary.projectName, Agents.name(chat.agent)]
+        if app.hasManyHosts, let name = chat.conn?.name { parts.insert(name, at: 0) }
+        return parts.joined(separator: " · ")
     }
 
     private var menu: some View {
@@ -154,19 +166,25 @@ struct ChatView: View {
                 }
             }
             intentBanner
-            if desktopMayBeOpen {
+            if chat.summary.openInTerminal == true {
+                Label("电脑的终端里正开着这个会话。手机上发的内容那边不会自动出现：回到电脑后先在终端里退出，再 resume 才能看到；在旧窗口里接着打字会让记录分叉。", systemImage: "terminal")
+                    .font(.caption).foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 6)
+            } else if desktopMayBeOpen {
                 Label("这个会话几分钟前还在电脑上动过。如果电脑上还开着，两边同时发消息会让记录分叉。", systemImage: "desktopcomputer")
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 6)
             }
             Composer(
-                text: $text, attachments: $attachments, focused: $focused, agent: chat.agent, cwd: chat.summary.cwd,
-                placeholder: placeholder, isRunning: chat.isRunning,
-                showQuickPhrases: chat.requests.isEmpty && chat.intent == .message, canSend: app.isConnected,
+                conn: chat.conn, text: $text, attachments: $attachments, focused: $focused, agent: chat.agent,
+                cwd: chat.summary.cwd, placeholder: placeholder, isRunning: chat.isRunning,
+                replySuggestion: chat.requests.isEmpty && chat.intent == .message ? chat.summary.suggestion : nil,
+                canSend: chat.conn?.isConnected ?? false,
                 onSend: send, onStop: { Task { await chat.interrupt() } },
-                onQuickPhrase: { phrase in
-                    Task { _ = await chat.send(phrase, images: []) }
+                onSendSuggestion: { suggestion in
+                    Task { _ = await chat.send(suggestion, images: []) }
                 }
             ) {
                 ModeMenu(agent: chat.agent, mode: chat.summary.mode, info: info) { mode in
@@ -184,7 +202,7 @@ struct ChatView: View {
     }
 
     private var desktopMayBeOpen: Bool {
-        guard chat.summary.isDesktop, chat.summary.live != true, let updated = chat.summary.updatedDate else { return false }
+        guard chat.summary.openInTerminal == nil, chat.summary.isDesktop, chat.summary.live != true, let updated = chat.summary.updatedDate else { return false }
         return Date().timeIntervalSince(updated) < 10 * 60
     }
 

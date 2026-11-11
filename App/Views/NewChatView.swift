@@ -4,10 +4,11 @@ import SwiftUI
 /// ones used, and sending the first message creates the session.
 struct NewChatView: View {
     @Environment(AppModel.self) private var app
-    let onCreated: (String) -> Void
+    let onCreated: (UUID, String) -> Void
 
+    @State private var hostID: UUID?
     @State private var agent = Prefs.lastAgent
-    @State private var cwd = Prefs.lastProject
+    @State private var cwd: String?
     @State private var model: String? = Prefs.lastModel(Prefs.lastAgent)
     @State private var mode: String? = Prefs.lastMode(Prefs.lastAgent)
     @State private var info: AgentInfo?
@@ -18,6 +19,8 @@ struct NewChatView: View {
     @State private var pickingProject = false
     @FocusState private var focused: Bool
 
+    private var conn: HostConnection? { app.connection(hostID) }
+
     var body: some View {
         VStack(spacing: 14) {
             Spacer()
@@ -25,7 +28,7 @@ struct NewChatView: View {
             Text(cwd == nil ? String(localized: "先选一个项目") : String(localized: "想让 \(Agents.name(agent)) 做什么？"))
                 .font(.title3.weight(.semibold))
             if let cwd {
-                Text(cwd.replacingOccurrences(of: app.hello?.home ?? "~", with: "~"))
+                Text(conn?.shortPath(cwd) ?? cwd)
                     .font(.footnote.monospaced()).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.head).padding(.horizontal, 24)
             }
@@ -40,6 +43,24 @@ struct NewChatView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             VStack(spacing: 8) {
                 HStack(spacing: 8) {
+                    if app.hasManyHosts {
+                        Menu {
+                            ForEach(app.ordered) { option in
+                                Button {
+                                    switchHost(option.id)
+                                } label: {
+                                    if option.id == hostID {
+                                        Label(option.name, systemImage: "checkmark")
+                                    } else {
+                                        Text(option.name)
+                                    }
+                                    Text(HostStatusText.text(option.status))
+                                }
+                            }
+                        } label: {
+                            ChipLabel(text: conn?.name ?? String(localized: "主机"), systemImage: "desktopcomputer")
+                        }
+                    }
                     Button {
                         pickingProject = true
                     } label: {
@@ -57,7 +78,7 @@ struct NewChatView: View {
                                     Text(Agents.name(option))
                                 }
                             }
-                            .disabled(!(app.hello?.has(option) ?? true))
+                            .disabled(!(conn?.hello?.has(option) ?? true))
                         }
                     } label: {
                         ChipLabel(text: Agents.name(agent), systemImage: agent == "codex" ? "circle.hexagongrid" : "asterisk")
@@ -66,10 +87,10 @@ struct NewChatView: View {
                 }
                 .padding(.horizontal, 4)
                 Composer(
-                    text: $text, attachments: $attachments, focused: $focused, agent: agent, cwd: cwd,
-                    placeholder: String(localized: "描述你要做的事…"), isRunning: false, showQuickPhrases: false,
-                    canSend: app.isConnected && cwd != nil && !creating,
-                    onSend: create, onStop: {}, onQuickPhrase: { _ in }
+                    conn: conn, text: $text, attachments: $attachments, focused: $focused, agent: agent, cwd: cwd,
+                    placeholder: String(localized: "描述你要做的事…"), isRunning: false,
+                    canSend: (conn?.isConnected ?? false) && cwd != nil && !creating,
+                    onSend: create, onStop: {}
                 ) {
                     ModeMenu(agent: agent, mode: mode, info: info) { mode = $0 }
                     ModelMenu(agent: agent, model: model, info: info) { model = $0 }
@@ -85,17 +106,16 @@ struct NewChatView: View {
         .navigationTitle("新会话")
         .navigationBarTitleDisplayMode(.inline)
         .sheet(isPresented: $pickingProject) {
-            ProjectPicker(selected: cwd) { path in
-                cwd = path
-                Prefs.lastProject = path
+            if let conn {
+                ProjectPicker(conn: conn, selected: cwd) { path in
+                    cwd = path
+                    Prefs.setLastProject(path, host: conn.id)
+                }
             }
         }
         .task {
-            info = await app.info(for: agent)
-            if cwd == nil {
-                await app.loadProjects()
-                cwd = app.projects.first?.path
-            }
+            if hostID == nil { hostID = app.hostForNewChat?.id }
+            await prepareHost()
             focused = true
         }
         .onChange(of: text) { _, value in Prefs.setDraft(value, "new") }
@@ -111,11 +131,29 @@ struct NewChatView: View {
         model = Prefs.lastModel(option)
         mode = Prefs.lastMode(option)
         info = nil
-        Task { info = await app.info(for: option) }
+        Task { info = await conn?.info(for: option) }
+    }
+
+    private func switchHost(_ id: UUID) {
+        guard id != hostID else { return }
+        hostID = id
+        info = nil
+        Task { await prepareHost() }
+    }
+
+    /// The host's last project (or its most recent one) and agent info.
+    private func prepareHost() async {
+        guard let conn else { return }
+        cwd = Prefs.lastProject(host: conn.id)
+        info = await conn.info(for: agent)
+        if cwd == nil {
+            await conn.loadProjects()
+            cwd = conn.projects.first?.path
+        }
     }
 
     private func create() {
-        guard let cwd else {
+        guard let cwd, let conn else {
             pickingProject = true
             return
         }
@@ -125,14 +163,14 @@ struct NewChatView: View {
         error = nil
         Task {
             do {
-                let summary = try await app.createSession(
+                let summary = try await conn.createSession(
                     agent: agent, cwd: cwd, text: message, images: attachments, model: model, mode: mode)
                 Prefs.setLastModel(model, agent)
                 Prefs.setLastMode(mode, agent)
                 text = ""
                 Prefs.setDraft("", "new")
                 creating = false
-                onCreated(summary.sid)
+                onCreated(conn.id, summary.sid)
             } catch {
                 creating = false
                 self.error = error.localizedDescription
@@ -142,15 +180,15 @@ struct NewChatView: View {
 }
 
 struct ProjectPicker: View {
-    @Environment(AppModel.self) private var app
     @Environment(\.dismiss) private var dismiss
+    let conn: HostConnection
     let selected: String?
     let choose: (String) -> Void
     @State private var query = ""
 
     private var filtered: [ProjectEntry] {
-        guard !query.isEmpty else { return app.projects }
-        return app.projects.filter { $0.path.localizedCaseInsensitiveContains(query) }
+        guard !query.isEmpty else { return conn.projects }
+        return conn.projects.filter { $0.path.localizedCaseInsensitiveContains(query) }
     }
 
     var body: some View {
@@ -185,7 +223,7 @@ struct ProjectPicker: View {
                 }
                 Section {
                     NavigationLink {
-                        FolderBrowser(path: app.hello?.home ?? "~") { path in pick(path) }
+                        FolderBrowser(conn: conn, path: conn.hello?.home ?? "~") { path in pick(path) }
                     } label: {
                         Label("浏览文件夹…", systemImage: "folder.badge.plus")
                     }
@@ -199,18 +237,17 @@ struct ProjectPicker: View {
                     Button("取消") { dismiss() }
                 }
             }
-            .task { await app.loadProjects() }
+            .task { await conn.loadProjects() }
         }
     }
 
     private func shortPath(_ path: String) -> String {
-        guard let home = app.hello?.home else { return path }
-        return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
+        conn.shortPath(path)
     }
 
     private func pick(_ path: String) {
         var path = path
-        if path.hasPrefix("~"), let home = app.hello?.home {
+        if path.hasPrefix("~"), let home = conn.hello?.home {
             path = home + path.dropFirst()
         }
         choose(path)
@@ -219,7 +256,7 @@ struct ProjectPicker: View {
 }
 
 struct FolderBrowser: View {
-    @Environment(AppModel.self) private var app
+    let conn: HostConnection
     let path: String
     let choose: (String) -> Void
     @State private var listing: DirListing?
@@ -238,7 +275,7 @@ struct FolderBrowser: View {
                 Section {
                     ForEach(listing.entries) { entry in
                         NavigationLink {
-                            FolderBrowser(path: entry.path, choose: choose)
+                            FolderBrowser(conn: conn, path: entry.path, choose: choose)
                         } label: {
                             Label(entry.name, systemImage: entry.git == true ? "folder.badge.gearshape" : "folder")
                         }
@@ -254,7 +291,7 @@ struct FolderBrowser: View {
         .navigationBarTitleDisplayMode(.inline)
         .task {
             do {
-                listing = try await app.call("dirs.list", ["path": .string(path)])
+                listing = try await conn.call("dirs.list", ["path": .string(path)])
             } catch {
                 self.error = error.localizedDescription
             }

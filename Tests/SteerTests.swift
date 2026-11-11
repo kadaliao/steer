@@ -98,6 +98,13 @@ struct WireTests {
         #expect(delta.itemId == "m:t0")
     }
 
+    @Test func upgradesTheHelperButNeverDowngrades() {
+        #expect(HelperLink.isVersion("0.1.2", olderThan: "0.2.0"))
+        #expect(HelperLink.isVersion("0.2", olderThan: "0.2.1"))
+        #expect(!HelperLink.isVersion("0.2.0", olderThan: "0.2.0"))
+        #expect(!HelperLink.isVersion("0.3.0", olderThan: "0.2.9"))
+    }
+
     @Test func encodesIntegerParamsWithoutAFraction() throws {
         let data = try JSONEncoder().encode(["id": JSONValue.number(3), "limit": 30])
         let text = String(decoding: data, as: UTF8.self)
@@ -107,7 +114,7 @@ struct WireTests {
 
     @MainActor @Test func chatAppliesDeltasAndResolvesRequests() {
         let summary = SessionSummary(sid: "s", agent: "codex", cwd: "/w", title: "", state: "running")
-        let chat = ChatModel(summary: summary, app: AppModel())
+        let chat = ChatModel(summary: summary, conn: nil)
         chat.apply(EventFrame(ev: "item", sid: "s", item: TimelineItem(id: "m", kind: "assistant", text: "He", streaming: true)))
         chat.apply(EventFrame(ev: "delta", sid: "s", itemId: "m", text: "llo"))
         #expect(chat.items.first?.text == "Hello")

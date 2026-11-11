@@ -5,7 +5,7 @@ import UIKit
 /// The message box. Uses the system keyboard (and so any input method and
 /// dictation), grows with the text, and can expand to a full-screen editor.
 struct Composer<Chips: View>: View {
-    @Environment(AppModel.self) private var app
+    let conn: HostConnection?
     @Binding var text: String
     @Binding var attachments: [ImageAttachment]
     var focused: FocusState<Bool>.Binding
@@ -13,40 +13,38 @@ struct Composer<Chips: View>: View {
     let cwd: String?
     let placeholder: String
     let isRunning: Bool
-    let showQuickPhrases: Bool
+    /// The agent's guess at the next message; one tap sends it.
+    var replySuggestion: String? = nil
     let canSend: Bool
     let onSend: () -> Void
     let onStop: () -> Void
-    let onQuickPhrase: (String) -> Void
+    var onSendSuggestion: (String) -> Void = { _ in }
     @ViewBuilder let chips: () -> Chips
 
     @State private var pickerItems: [PhotosPickerItem] = []
+    @State private var showPhotoPicker = false
     @State private var showEditor = false
     @State private var fileSuggestions: [String] = []
-    @State private var commands: [CommandOption] = []
-    @State private var phrases = Prefs.quickPhrases
+    @State private var commands: [CommandOption]?
+    @State private var commandsError: String?
+    /// Where the token was when its list was closed; it stays closed until
+    /// a new `@`, `/` or `$` starts.
+    @State private var dismissedAt: Int?
 
     private var trimmed: String { text.trimmingCharacters(in: .whitespacesAndNewlines) }
     private var hasContent: Bool { !trimmed.isEmpty || !attachments.isEmpty }
 
-    /// The `@word` being typed at the end of the text, if any.
-    private var mentionQuery: String? {
-        guard let last = text.split(separator: " ", omittingEmptySubsequences: false).last,
-            last.hasPrefix("@"), !last.contains("\n")
-        else { return nil }
-        return String(last.dropFirst())
-    }
-
-    private var commandQuery: String? {
-        guard text.hasPrefix("/"), !text.contains(" "), !text.contains("\n") else { return nil }
-        return String(text.dropFirst())
-    }
-
     var body: some View {
         VStack(spacing: 8) {
-            suggestions
-            if showQuickPhrases && text.isEmpty && attachments.isEmpty {
-                quickPhraseBar
+            if focused.wrappedValue, let trigger, trigger.start != dismissedAt {
+                suggestionPanel(trigger)
+            } else if let replySuggestion, !replySuggestion.isEmpty, text.isEmpty, attachments.isEmpty, !isRunning {
+                ReplySuggestionRow(text: replySuggestion, enabled: canSend) {
+                    onSendSuggestion(replySuggestion)
+                } edit: {
+                    text = replySuggestion
+                    focused.wrappedValue = true
+                }
             }
             VStack(alignment: .leading, spacing: 8) {
                 if !attachments.isEmpty { attachmentStrip }
@@ -70,6 +68,17 @@ struct Composer<Chips: View>: View {
                         .buttonStyle(.borderless)
                         .accessibilityLabel("全屏编辑")
                     }
+                    if focused.wrappedValue {
+                        Button { focused.wrappedValue = false } label: {
+                            Image(systemName: "keyboard.chevron.compact.down")
+                                .font(.system(size: 15, weight: .medium))
+                                .frame(width: 30, height: 34)
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("收起键盘")
+                        .accessibilityIdentifier("hideKeyboard")
+                    }
                     sendButton
                 }
             }
@@ -79,11 +88,108 @@ struct Composer<Chips: View>: View {
             .background(RoundedRectangle(cornerRadius: 24).fill(Color(.secondarySystemBackground)))
         }
         .onChange(of: pickerItems) { _, items in loadPicked(items) }
-        .task(id: mentionQuery) { await loadFiles() }
-        .task(id: commandQuery == nil) { await loadCommands() }
+        .onChange(of: trigger?.start) { _, start in
+            if start == nil { dismissedAt = nil }
+        }
+        .task(id: fileQuery) { await loadFiles() }
+        .task(id: commandKey) { await loadCommands() }
         .sheet(isPresented: $showEditor) {
             FullScreenEditor(text: $text, placeholder: placeholder)
         }
+    }
+
+    // MARK: triggers
+
+    /// What the last word being typed asks for: a file after `@`, a command
+    /// or skill after a leading `/`, a Codex skill after `$`.
+    private struct Trigger: Equatable {
+        enum Kind { case file, command, skill }
+        let kind: Kind
+        let query: String
+        /// Offset of the trigger character, which identifies the token.
+        let start: Int
+    }
+
+    private var trigger: Trigger? {
+        let tokenStart = text.lastIndex(where: { $0 == " " || $0 == "\n" }).map { text.index(after: $0) } ?? text.startIndex
+        let token = text[tokenStart...]
+        guard let first = token.first else { return nil }
+        let start = text.distance(from: text.startIndex, to: tokenStart)
+        let query = String(token.dropFirst())
+        switch first {
+        case "@": return Trigger(kind: .file, query: query, start: start)
+        case "/" where start == 0: return Trigger(kind: .command, query: query, start: start)
+        case "$" where agent == "codex": return Trigger(kind: .skill, query: query, start: start)
+        default: return nil
+        }
+    }
+
+    private var fileQuery: String? {
+        guard let trigger, trigger.kind == .file, trigger.start != dismissedAt else { return nil }
+        return trigger.query
+    }
+
+    private var commandKey: String? {
+        guard let trigger, trigger.kind != .file, let cwd else { return nil }
+        return agent + "|" + cwd
+    }
+
+    private func replaceToken(_ trigger: Trigger, with word: String) {
+        let index = text.index(text.startIndex, offsetBy: trigger.start)
+        text = String(text[..<index]) + word + " "
+    }
+
+    // MARK: lists
+
+    @ViewBuilder private func suggestionPanel(_ trigger: Trigger) -> some View {
+        switch trigger.kind {
+        case .file:
+            if !fileSuggestions.isEmpty {
+                SuggestionPanel(title: String(localized: "文件"), rows: fileSuggestions.count, close: { close(trigger) }) {
+                    ForEach(fileSuggestions, id: \.self) { path in
+                        SuggestionRow(title: path, detail: nil) { replaceToken(trigger, with: "@" + path) }
+                    }
+                }
+            }
+        case .command, .skill:
+            let matches = matching(trigger.query)
+            SuggestionPanel(title: agent == "codex" ? String(localized: "技能") : String(localized: "命令和技能"),
+                            rows: max(matches.count, 1), close: { close(trigger) }) {
+                if commands != nil {
+                    if matches.isEmpty {
+                        SuggestionNote(text: trigger.query.isEmpty
+                                       ? String(localized: "这个项目里没有找到可用的命令或技能")
+                                       : String(localized: "没有匹配的"))
+                    }
+                    ForEach(matches) { option in
+                        SuggestionRow(title: (agent == "codex" ? "$" : "/") + option.name,
+                                      detail: option.description, badge: option.kind == "builtin" ? String(localized: "内置") : nil) {
+                            replaceToken(trigger, with: (agent == "codex" ? "$" : "/") + option.name)
+                        }
+                    }
+                } else if let commandsError {
+                    SuggestionNote(text: commandsError)
+                } else {
+                    SuggestionNote(text: String(localized: "正在读取命令和技能…"), loading: true)
+                }
+            }
+        }
+    }
+
+    private func matching(_ query: String) -> [CommandOption] {
+        guard let commands else { return [] }
+        guard !query.isEmpty else { return commands }
+        let byName = commands.filter { $0.name.localizedCaseInsensitiveContains(query) }
+        let prefixed = byName.filter { $0.name.lowercased().hasPrefix(query.lowercased()) }
+        let others = byName.filter { !$0.name.lowercased().hasPrefix(query.lowercased()) }
+        let byDescription = commands.filter {
+            !$0.name.localizedCaseInsensitiveContains(query) && ($0.description ?? "").localizedCaseInsensitiveContains(query)
+        }
+        return prefixed + others + byDescription
+    }
+
+    private func close(_ trigger: Trigger) {
+        withAnimation(.snappy) { dismissedAt = trigger.start }
     }
 
     // MARK: pieces
@@ -136,10 +242,14 @@ struct Composer<Chips: View>: View {
                 Label("引用文件 @", systemImage: "at")
             }
             Button {
-                text = "/"
+                if agent == "codex" {
+                    text += (text.isEmpty || text.hasSuffix(" ") ? "$" : " $")
+                } else {
+                    text = "/" + text
+                }
                 focused.wrappedValue = true
             } label: {
-                Label("命令 /", systemImage: "slash.circle")
+                Label(agent == "codex" ? "技能 $" : "命令和技能 /", systemImage: "wand.and.stars")
             }
         } label: {
             Image(systemName: "plus")
@@ -148,30 +258,6 @@ struct Composer<Chips: View>: View {
                 .background(Circle().fill(Color(.tertiarySystemFill)))
         }
         .photosPicker(isPresented: $showPhotoPicker, selection: $pickerItems, maxSelectionCount: 4, matching: .images)
-    }
-
-    @State private var showPhotoPicker = false
-
-    private var quickPhraseBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(phrases, id: \.self) { phrase in
-                    Button {
-                        onQuickPhrase(phrase)
-                    } label: {
-                        Text(phrase)
-                            .font(.footnote.weight(.medium))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 7)
-                            .background(Capsule().strokeBorder(Color(.separator)))
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!canSend)
-                }
-            }
-            .padding(.horizontal, 2)
-        }
-        .onAppear { phrases = Prefs.quickPhrases }
     }
 
     private var attachmentStrip: some View {
@@ -201,42 +287,33 @@ struct Composer<Chips: View>: View {
         }
     }
 
-    @ViewBuilder private var suggestions: some View {
-        if mentionQuery != nil, !fileSuggestions.isEmpty {
-            SuggestionList(entries: fileSuggestions.map { ($0, nil) }) { path in
-                var parts = text.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
-                parts.removeLast()
-                parts.append("@" + path)
-                text = parts.joined(separator: " ") + " "
-            }
-        } else if let query = commandQuery {
-            let matches = commands.filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) }.prefix(30)
-            if !matches.isEmpty {
-                SuggestionList(entries: matches.map { ("/" + $0.name, $0.description) }) { name in
-                    text = name + " "
-                }
-            }
-        }
-    }
-
     // MARK: loading
 
     private func loadFiles() async {
-        guard let query = mentionQuery, let cwd else {
+        guard let query = fileQuery, let cwd, let conn else {
             fileSuggestions = []
             return
         }
         try? await Task.sleep(for: .milliseconds(150))
         guard !Task.isCancelled else { return }
-        let list: FileList? = try? await app.call("files.search", [
+        let list: FileList? = try? await conn.call("files.search", [
             "cwd": .string(cwd), "query": .string(query), "limit": 30,
         ])
         if !Task.isCancelled { fileSuggestions = list?.files ?? [] }
     }
 
     private func loadCommands() async {
-        guard commandQuery != nil, commands.isEmpty else { return }
-        commands = await app.info(for: agent)?.commands ?? []
+        guard commandKey != nil, let cwd, let conn else { return }
+        commandsError = nil
+        commands = conn.cachedCommands(agent: agent, cwd: cwd)
+        do {
+            let list = try await conn.commands(agent: agent, cwd: cwd)
+            if !Task.isCancelled { commands = list }
+        } catch {
+            if !Task.isCancelled, commands == nil {
+                commandsError = String(localized: "没能读取命令：\(error.localizedDescription)")
+            }
+        }
     }
 
     private func loadPicked(_ items: [PhotosPickerItem]) {
@@ -261,35 +338,122 @@ struct Composer<Chips: View>: View {
     }
 }
 
-struct SuggestionList: View {
-    let entries: [(String, String?)]
-    let pick: (String) -> Void
+/// The agent's suggested next message: tap to send, pencil to edit first.
+struct ReplySuggestionRow: View {
+    let text: String
+    let enabled: Bool
+    let send: () -> Void
+    let edit: () -> Void
 
     var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(entries, id: \.0) { entry in
-                    Button {
-                        pick(entry.0)
-                    } label: {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(entry.0).font(.system(.callout, design: .monospaced)).lineLimit(1)
-                            if let detail = entry.1, !detail.isEmpty {
-                                Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 9)
-                        .contentShape(Rectangle())
+        HStack(spacing: 6) {
+            Button(action: send) {
+                HStack(spacing: 6) {
+                    Image(systemName: "sparkles").font(.caption.weight(.semibold)).foregroundStyle(Color.accentColor)
+                    Text(text).lineLimit(2).multilineTextAlignment(.leading)
+                    Spacer(minLength: 0)
+                    Image(systemName: "arrow.up.circle.fill").foregroundStyle(Color.accentColor)
+                }
+                .font(.subheadline)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Capsule().strokeBorder(Color.accentColor.opacity(0.35)))
+                .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .disabled(!enabled)
+            .accessibilityIdentifier("replySuggestion")
+            Button(action: edit) {
+                Image(systemName: "pencil")
+                    .font(.footnote.weight(.semibold))
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(Color(.tertiarySystemFill)))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("改一改再发")
+        }
+    }
+}
+
+/// A floating list above the composer with a title and a close button.
+struct SuggestionPanel<Content: View>: View {
+    let title: String
+    let rows: Int
+    let close: () -> Void
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Spacer()
+                Button(action: close) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .bold))
+                        .frame(width: 26, height: 26)
+                        .background(Circle().fill(Color(.tertiarySystemFill)))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("关闭列表")
+                .accessibilityIdentifier("closeSuggestions")
+            }
+            .padding(.leading, 14)
+            .padding(.trailing, 8)
+            .padding(.vertical, 6)
+            Divider()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) { content() }
+            }
+            .frame(height: min(240, CGFloat(rows) * 52))
+        }
+        .background(RoundedRectangle(cornerRadius: 16).fill(Color(.systemBackground)).shadow(color: .black.opacity(0.12), radius: 10))
+        .transition(.opacity)
+    }
+}
+
+struct SuggestionRow: View {
+    let title: String
+    let detail: String?
+    var badge: String? = nil
+    let pick: () -> Void
+
+    var body: some View {
+        Button(action: pick) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(title).font(.system(.callout, design: .monospaced)).lineLimit(1)
+                    if let badge {
+                        Text(badge).font(.caption2).foregroundStyle(.secondary)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Capsule().strokeBorder(Color(.separator)))
                     }
-                    .buttonStyle(.plain)
-                    Divider().padding(.leading, 14)
+                }
+                if let detail, !detail.isEmpty {
+                    Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+            .contentShape(Rectangle())
         }
-        .frame(maxHeight: 220)
-        .background(RoundedRectangle(cornerRadius: 16).fill(Color(.systemBackground)).shadow(color: .black.opacity(0.12), radius: 10))
+        .buttonStyle(.plain)
+        Divider().padding(.leading, 14)
+    }
+}
+
+struct SuggestionNote: View {
+    let text: String
+    var loading = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if loading { ProgressView().controlSize(.small) }
+            Text(text).font(.footnote).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 14)
     }
 }
 

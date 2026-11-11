@@ -55,23 +55,24 @@ final class ChatModel {
     /// Answers collected so far for a multi-question request.
     var partialAnswers: [String: [String: JSONValue]] = [:]
     private var index: [String: Int] = [:]
-    @ObservationIgnored private weak var app: AppModel?
+    /// The host this session lives on.
+    @ObservationIgnored private(set) weak var conn: HostConnection?
 
-    init(summary: SessionSummary, app: AppModel) {
+    init(summary: SessionSummary, conn: HostConnection?) {
         self.sid = summary.sid
         self.summary = summary
-        self.app = app
+        self.conn = conn
     }
 
     var isRunning: Bool { summary.isRunning }
     var agent: String { summary.agent }
 
     func load() async {
-        guard let app else { return }
+        guard let conn else { return }
         loading = true
         defer { loading = false }
         do {
-            let snapshot: Snapshot = try await app.call("session.open", [
+            let snapshot: Snapshot = try await conn.call("session.open", [
                 "sid": .string(sid), "agent": .string(summary.agent), "cwd": .string(summary.cwd),
                 "title": .string(summary.title),
             ], timeout: .seconds(60))
@@ -89,8 +90,8 @@ final class ChatModel {
 
     func close() {
         isVisible = false
-        guard let app else { return }
-        Task { let _: Empty? = try? await app.call("session.close", ["sid": .string(sid)]) }
+        guard let conn else { return }
+        Task { let _: Empty? = try? await conn.call("session.close", ["sid": .string(sid)]) }
     }
 
     private func rebuildIndex() {
@@ -131,7 +132,7 @@ final class ChatModel {
     // MARK: actions
 
     func send(_ text: String, images: [ImageAttachment]) async -> Bool {
-        guard let app else { return false }
+        guard let conn else { return false }
         switch intent {
         case .denyWithNote(let request):
             intent = .message
@@ -143,7 +144,7 @@ final class ChatModel {
             break
         }
         do {
-            let _: Empty = try await app.call("session.send", [
+            let _: Empty = try await conn.call("session.send", [
                 "sid": .string(sid), "text": .string(text), "images": .array(images.map(\.json)),
             ], timeout: .seconds(120))
             actionError = nil
@@ -157,9 +158,9 @@ final class ChatModel {
     @discardableResult
     func respond(_ request: AgentRequest, decision: String, message: String = "",
                  answers: [String: JSONValue] = [:]) async -> Bool {
-        guard let app else { return false }
+        guard let conn else { return false }
         do {
-            let _: Empty = try await app.call("session.respond", [
+            let _: Empty = try await conn.call("session.respond", [
                 "sid": .string(sid), "rid": .string(request.rid), "decision": .string(decision),
                 "message": .string(message), "answers": .object(answers),
             ])
@@ -187,38 +188,30 @@ final class ChatModel {
     }
 
     func interrupt() async {
-        guard let app else { return }
-        let _: Empty? = try? await app.call("session.interrupt", ["sid": .string(sid)])
+        guard let conn else { return }
+        let _: Empty? = try? await conn.call("session.interrupt", ["sid": .string(sid)])
     }
 
     func setMode(_ mode: String) async {
-        guard let app else { return }
-        if let summary: SessionSummary = try? await app.call("session.setMode", ["sid": .string(sid), "mode": .string(mode)]) {
+        guard let conn else { return }
+        if let summary: SessionSummary = try? await conn.call("session.setMode", ["sid": .string(sid), "mode": .string(mode)]) {
             self.summary = summary
         }
         Prefs.setLastMode(mode, agent)
     }
 
     func setModel(_ model: String) async {
-        guard let app else { return }
-        if let summary: SessionSummary = try? await app.call("session.setModel", ["sid": .string(sid), "model": .string(model)]) {
+        guard let conn else { return }
+        if let summary: SessionSummary = try? await conn.call("session.setModel", ["sid": .string(sid), "model": .string(model)]) {
             self.summary = summary
         }
         Prefs.setLastModel(model, agent)
     }
 
     func rename(_ title: String) async {
-        guard let app else { return }
-        if let summary: SessionSummary = try? await app.call("session.rename", ["sid": .string(sid), "title": .string(title)]) {
+        guard let conn else { return }
+        if let summary: SessionSummary = try? await conn.call("session.rename", ["sid": .string(sid), "title": .string(title)]) {
             self.summary = summary
         }
-    }
-
-    func searchFiles(_ query: String) async -> [String] {
-        guard let app else { return [] }
-        let list: FileList? = try? await app.call("files.search", [
-            "cwd": .string(summary.cwd), "query": .string(query), "limit": 30,
-        ])
-        return list?.files ?? []
     }
 }

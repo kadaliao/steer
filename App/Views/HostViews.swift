@@ -14,15 +14,15 @@ struct RootView: View {
                 HomeView()
             }
         }
-        .task { await app.connect() }
+        .task { await app.connectAll() }
         .alert(
-            "确认主机", isPresented: Binding(get: { app.pendingTrust != nil }, set: { if !$0 { app.pendingTrust = nil } }),
-            presenting: app.pendingTrust
+            "确认主机", isPresented: Binding(get: { !app.trustQueue.isEmpty }, set: { _ in }),
+            presenting: app.trustQueue.first
         ) { _ in
-            Button("取消", role: .cancel) { app.pendingTrust = nil }
+            Button("取消", role: .cancel) { app.declineTrust() }
             Button("信任并连接") { app.trustPending() }
         } message: { pending in
-            Text("第一次连接 \(pending.host.address)。它的指纹是\n\(pending.fingerprint)\n\n在电脑上运行 ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub 可以核对。")
+            Text("第一次连接 \(pending.host.displayName)（\(pending.host.address)）。它的指纹是\n\(pending.fingerprint)\n\n在电脑上运行 ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub 可以核对。")
         }
     }
 }
@@ -45,6 +45,9 @@ struct HostEditorView: View {
 
     var body: some View {
         Form {
+            if let host, let conn = app.connection(host.id) {
+                HostStatusSection(conn: conn)
+            }
             if isFirstRun {
                 Section {
                     VStack(alignment: .leading, spacing: 6) {
@@ -129,73 +132,65 @@ struct HostEditorView: View {
         updated.auth = auth
         if changedEndpoint { updated.fingerprint = nil }
         app.saveHost(updated, password: auth == .password ? password : nil)
-        if updated.id == app.activeHost?.id {
-            app.disconnect()
-            Task { await app.connect() }
-        }
+        app.connection(updated.id)?.reconnect()
         if !isFirstRun { dismiss() }
+    }
+}
+
+/// A host's link state and what runs there.
+struct HostStatusSection: View {
+    let conn: HostConnection
+
+    var body: some View {
+        Section("状态") {
+            HStack {
+                StatusDot(status: conn.status)
+                Text(HostStatusText.text(conn.status)).lineLimit(3)
+                Spacer()
+                if !conn.isConnected {
+                    Button("重连") { conn.reconnect() }
+                }
+            }
+            if let hello = conn.hello {
+                LabeledContent("Claude Code", value: hello.agents["claude"]??.version ?? String(localized: "未安装"))
+                LabeledContent("Codex", value: hello.agents["codex"]??.version ?? String(localized: "未安装"))
+                LabeledContent("主机助手", value: hello.helper)
+                LabeledContent("Python", value: hello.python ?? "")
+                if hello.platform == "darwin", hello.launchd != "launchd" {
+                    Text("助手没能以登录会话身份运行，Claude 可能读不到登录状态。在电脑上登录桌面后重连即可。")
+                        .font(.footnote).foregroundStyle(.orange)
+                }
+            }
+        }
     }
 }
 
 struct SettingsView: View {
     @Environment(AppModel.self) private var app
-    @State private var phrases = Prefs.quickPhrases
-    @State private var newPhrase = ""
     @State private var returnSends = Prefs.returnSends
 
     var body: some View {
         Form {
-            Section("主机") {
-                ForEach(app.hosts) { host in
-                    HStack {
-                        Button {
-                            app.switchHost(host)
-                        } label: {
-                            HStack {
-                                Image(systemName: host.id == app.activeHost?.id ? "checkmark.circle.fill" : "circle")
-                                    .foregroundStyle(Color.accentColor)
-                                VStack(alignment: .leading) {
-                                    Text(host.displayName).foregroundStyle(.primary)
-                                    Text("\(host.username)@\(host.address):\(host.port)").font(.caption).foregroundStyle(.secondary)
-                                }
+            Section {
+                ForEach(app.ordered) { conn in
+                    NavigationLink {
+                        HostEditorView(host: conn.host, isFirstRun: false)
+                    } label: {
+                        HStack(spacing: 10) {
+                            StatusDot(status: conn.status)
+                            VStack(alignment: .leading) {
+                                Text(conn.name)
+                                Text("\(conn.host.username)@\(conn.host.address):\(conn.host.port)")
+                                    .font(.caption).foregroundStyle(.secondary)
                             }
                         }
-                        Spacer()
-                        NavigationLink("") { HostEditorView(host: host, isFirstRun: false) }.frame(width: 30)
                     }
                 }
                 NavigationLink("添加主机") { HostEditorView(host: nil, isFirstRun: false) }
-            }
-            if let hello = app.hello {
-                Section("当前主机") {
-                    LabeledContent("Claude Code", value: hello.agents["claude"]??.version ?? String(localized: "未安装"))
-                    LabeledContent("Codex", value: hello.agents["codex"]??.version ?? String(localized: "未安装"))
-                    LabeledContent("主机助手", value: hello.helper)
-                    LabeledContent("Python", value: hello.python ?? "")
-                    if hello.platform == "darwin", hello.launchd != "launchd" {
-                        Text("助手没能以登录会话身份运行，Claude 可能读不到登录状态。在电脑上登录桌面后重连即可。")
-                            .font(.footnote).foregroundStyle(.orange)
-                    }
-                }
-            }
-            Section {
-                ForEach(phrases, id: \.self) { phrase in Text(phrase) }
-                    .onDelete { phrases.remove(atOffsets: $0); Prefs.quickPhrases = phrases }
-                    .onMove { phrases.move(fromOffsets: $0, toOffset: $1); Prefs.quickPhrases = phrases }
-                HStack {
-                    TextField("新短语", text: $newPhrase)
-                    Button("添加") {
-                        let phrase = newPhrase.trimmingCharacters(in: .whitespaces)
-                        guard !phrase.isEmpty else { return }
-                        phrases.append(phrase)
-                        Prefs.quickPhrases = phrases
-                        newPhrase = ""
-                    }
-                }
             } header: {
-                Text("快捷短语")
+                Text("主机")
             } footer: {
-                Text("输入框上方的一排短语，点一下就直接发出。")
+                Text("所有主机同时保持连接，首页可以看全部，也可以只看一台。")
             }
             Section {
                 Toggle("回车直接发送", isOn: $returnSends)
@@ -205,6 +200,5 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("设置")
-        .toolbar { EditButton() }
     }
 }

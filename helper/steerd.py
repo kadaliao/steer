@@ -24,6 +24,7 @@ import glob
 import json
 import os
 import plistlib
+import re
 import shutil
 import signal
 import socket
@@ -32,7 +33,7 @@ import sys
 import time
 import uuid
 
-VERSION = "0.1.2"
+VERSION = "0.2.1"
 PROTO = 1
 
 HOME = os.path.expanduser("~")
@@ -586,6 +587,51 @@ def codex_item(item: dict, cwd: str, client_ids: dict):
 # Sessions
 # ---------------------------------------------------------------------------
 
+COMMANDS_TTL = 600
+_open_cache = [0.0, {}]
+
+
+def claude_open_sessions(root=None):
+    """sessionId -> pid for each Claude session a terminal has open right now,
+    from the registry Claude Code keeps in ~/.claude/sessions/<pid>.json
+    (`entrypoint: cli`; print-mode processes say `sdk-cli`)."""
+    now = time.time()
+    if root is None and now - _open_cache[0] < 3:
+        return _open_cache[1]
+    found = {}
+    for path in glob.glob(os.path.join(root or os.path.join(HOME, ".claude", "sessions"), "*.json")):
+        try:
+            with open(path) as f:
+                d = json.load(f)
+            pid = int(d.get("pid") or 0)
+            # `claude -p` (Steer's own, or any SDK host) registers too, as sdk-*.
+            if d.get("kind") != "interactive" or str(d.get("entrypoint") or "").startswith("sdk") \
+                    or not pid or not d.get("sessionId"):
+                continue
+            os.kill(pid, 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        found[d["sessionId"]] = pid
+    if root is None:
+        _open_cache[:] = [now, found]
+    return found
+SKILL_MENTION = re.compile(r"(?<![\w$])\$([A-Za-z0-9][\w:.-]*)")
+
+
+def claude_command_list(info):
+    """Claude's `initialize` commands: skills and custom commands first, then
+    the built-in ones."""
+    out = []
+    for c in (info or {}).get("commands") or []:
+        if not c.get("name"):
+            continue
+        out.append({"name": c["name"], "description": head(c.get("description") or "", 160),
+                    "argumentHint": c.get("argumentHint") or "",
+                    "kind": "builtin" if c.get("builtin") else "skill"})
+    out.sort(key=lambda c: c["kind"] == "builtin")
+    return out
+
+
 class OpError(Exception):
     def __init__(self, code: str, message: str = ""):
         super().__init__(message or code)
@@ -611,6 +657,7 @@ class Session:
         self.last_text = meta.get("lastText") or ""
         self.error = None
         self.unsent = []
+        self.suggestion = None  # the agent's guess at the next user message
 
     @property
     def sid(self) -> str:
@@ -657,6 +704,7 @@ class Session:
             "source": self.meta.get("source", "steer"),
             "live": self.is_live(),
             "error": self.error,
+            "suggestion": self.suggestion if state == "idle" else None,
         }
 
     def is_live(self) -> bool:
@@ -722,6 +770,7 @@ class Session:
     def set_state(self, state, error=None):
         if state == "running" and self.state != "running":
             self.running_since = now_ms()
+            self.suggestion = None
         if state != "running":
             self.running_since = None
             self.activity = None
@@ -798,6 +847,12 @@ class ClaudeSession(Session):
     def is_live(self):
         return self.proc is not None and self.proc.returncode is None
 
+    def summary(self) -> dict:
+        d = super().summary()
+        pid = claude_open_sessions().get(self.native_id)
+        d["openInTerminal"] = bool(pid) and not (self.proc is not None and self.proc.pid == pid)
+        return d
+
     async def load(self):
         if self.loaded:
             return
@@ -845,6 +900,10 @@ class ClaudeSession(Session):
             args += ["--model", self.meta["model"]]
         if self.meta.get("mode"):
             args += ["--permission-mode", self.meta["mode"]]
+        init = {"subtype": "initialize"}
+        if await self.hub.claude_supports("--prompt-suggestions"):
+            args += ["--prompt-suggestions", "true"]
+            init["promptSuggestions"] = True
         if not os.path.isdir(self.cwd):
             raise OpError("cwd_missing", self.cwd)
         log("claude start", self.sid, " ".join(args[1:]))
@@ -858,11 +917,11 @@ class ClaudeSession(Session):
         self.reader_task = asyncio.ensure_future(self._read_stdout(proc))
         asyncio.ensure_future(self._read_stderr(proc))
         try:
-            info = await self.control({"subtype": "initialize"}, timeout=90)
+            info = await self.control(init, timeout=90)
         except OpError:
             raise OpError("agent_failed", "\n".join(self.stderr_tail[-5:]) or "Claude did not start")
         if isinstance(info, dict):
-            self.hub.remember_claude_info(info)
+            self.hub.remember_claude_info(info, self.cwd)
             mode = info.get("current_permission_mode")
             if mode and not self.meta.get("mode"):
                 self.meta["mode"] = mode
@@ -999,6 +1058,12 @@ class ClaudeSession(Session):
         if t == "result":
             self.on_result(m)
             return
+        if t == "prompt_suggestion":
+            text = (m.get("suggestion") or "").strip()
+            if text and self.state == "idle" and not self.pending and not self.queued:
+                self.suggestion = head(text, 300)
+                self.hub.session_changed(self, urgent=True)
+            return
 
     def on_stream_event(self, ev):
         et = ev.get("type")
@@ -1095,6 +1160,7 @@ class ClaudeSession(Session):
     async def send(self, text, images):
         await self.load()
         busy = self.state == "running" or bool(self.pending)
+        self.suggestion = None
         item = {"id": new_id("u"), "kind": "user", "text": text, "images": len(images or []), "queued": busy}
         self.put(item)
         if busy:
@@ -1547,6 +1613,7 @@ class CodexSession(Session):
                 inputs.append({"type": "text", "text": text, "text_elements": []})
             for img in images or []:
                 inputs.append({"type": "localImage", "path": save_upload(img)})
+            inputs += await self.skill_inputs(text)
             if steering and self.is_live() and self.turn_id:
                 await self.hub.codex.request("turn/steer", {"threadId": self.sid, "input": inputs,
                                                             "expectedTurnId": self.turn_id,
@@ -1574,6 +1641,18 @@ class CodexSession(Session):
         self.adopt()
         self.save()
         return {"id": item_id}
+
+    async def skill_inputs(self, text):
+        """`$name` in the text attaches that skill, as the Codex TUI does."""
+        names = [n.rstrip(".:-") for n in SKILL_MENTION.findall(text or "")]
+        if not names:
+            return []
+        try:
+            skills = await self.hub.codex_skill_list(self.cwd)
+        except OpError:
+            return []
+        paths = {s["name"]: s["path"] for s in skills if s.get("name") and s.get("path")}
+        return [{"type": "skill", "name": n, "path": paths[n]} for n in dict.fromkeys(names) if n in paths]
 
     async def interrupt(self):
         if self.turn_id and self.is_live():
@@ -1760,6 +1839,10 @@ class Hub:
         self.dirty = set()
         self.flush_scheduled = False
         self.claude_info = self._load_cache()
+        self.claude_cmds = {}     # cwd -> (time, commands)
+        self.codex_skills = {}    # cwd -> (time, skills)
+        self.probe_locks = {}
+        self._claude_help = (0, "")
         self.agent_versions = {}
         self.stopping = asyncio.Event()
 
@@ -1778,20 +1861,103 @@ class Hub:
         except Exception:
             pass
 
-    def remember_claude_info(self, info):
+    def remember_claude_info(self, info, cwd=None):
         self.claude_info["models"] = info.get("models") or self.claude_info.get("models")
-        commands = []
-        for c in info.get("commands") or []:
-            commands.append({"name": c.get("name"), "description": head(c.get("description") or "", 160),
-                             "argumentHint": c.get("argumentHint") or ""})
+        commands = claude_command_list(info)
         if commands:
             self.claude_info["commands"] = commands
+            if cwd:
+                self.claude_cmds[cwd] = (time.time(), commands)
         self._save_cache()
 
     def remember_claude_commands(self, names):
         if not self.claude_info.get("commands"):
-            self.claude_info["commands"] = [{"name": n, "description": "", "argumentHint": ""} for n in names]
+            self.claude_info["commands"] = [{"name": n, "description": "", "argumentHint": "", "kind": "skill"}
+                                            for n in names]
             self._save_cache()
+
+    # agent capabilities ------------------------------------------------
+    async def claude_supports(self, flag):
+        """Whether the installed claude lists `flag` in --help (checked hourly)."""
+        checked, text = self._claude_help
+        if time.time() - checked > 3600:
+            text = ""
+            claude = find_bin("claude")
+            if claude:
+                proc = await asyncio.create_subprocess_exec(
+                    claude, "--help", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                try:
+                    out, _ = await asyncio.wait_for(proc.communicate(), 20)
+                    text = out.decode("utf-8", "replace")
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+            self._claude_help = (time.time(), text)
+        return flag in text
+
+    async def claude_probe(self, cwd):
+        """Starts Claude just long enough to answer `initialize`: its commands,
+        skills and models for this folder. No message is sent, so nothing is
+        recorded and no usage is spent; hooks are switched off for the probe."""
+        claude = find_bin("claude")
+        if not claude:
+            raise OpError("agent_missing", "claude not found on PATH")
+        env = dict(os.environ)
+        env.pop("CLAUDECODE", None)
+        proc = await asyncio.create_subprocess_exec(
+            claude, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+            "--settings", json.dumps({"disableAllHooks": True}),
+            cwd=cwd if os.path.isdir(cwd) else HOME, env=env, stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, limit=LINE_LIMIT)
+
+        async def answer():
+            request = {"type": "control_request", "request_id": "probe", "request": {"subtype": "initialize"}}
+            proc.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
+            await proc.stdin.drain()
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    raise OpError("agent_failed", "Claude exited")
+                try:
+                    m = json.loads(line)
+                except Exception:
+                    continue
+                if m.get("type") == "control_response":
+                    resp = m.get("response") or {}
+                    if resp.get("subtype") == "error":
+                        raise OpError("agent_error", resp.get("error") or "error")
+                    return resp.get("response") or {}
+
+        try:
+            info = await asyncio.wait_for(answer(), 30)
+        except asyncio.TimeoutError:
+            raise OpError("timeout", "Claude did not answer")
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            await proc.wait()
+        self.remember_claude_info(info, cwd)
+        return info
+
+    async def codex_skill_list(self, cwd, force=False):
+        cached = self.codex_skills.get(cwd)
+        if cached and not force and time.time() - cached[0] < COMMANDS_TTL:
+            return cached[1]
+        r = await self.codex.request("skills/list", {"cwds": [cwd], "forceReload": bool(force)}, timeout=30)
+        skills = []
+        for entry in (r or {}).get("data") or []:
+            for s in entry.get("skills") or []:
+                if s.get("enabled") is False or not s.get("name"):
+                    continue
+                iface = s.get("interface") or {}
+                skills.append({"name": s["name"], "path": s.get("path"),
+                               "description": head(iface.get("shortDescription") or s.get("shortDescription")
+                                                   or s.get("description") or "", 160)})
+        self.codex_skills[cwd] = (time.time(), skills)
+        return skills
 
     def load_sessions(self):
         os.makedirs(META_DIR, exist_ok=True)
@@ -2057,6 +2223,11 @@ class Hub:
     async def op_agent_info(self, client, req):
         agent = req.get("agent")
         if agent == "claude":
+            if not self.claude_info.get("models"):
+                try:
+                    await self.claude_probe(req.get("cwd") or HOME)
+                except OpError:
+                    pass
             models = [{"id": m.get("value"), "name": m.get("displayName"), "description": m.get("description")}
                       for m in self.claude_info.get("models") or []]
             if not models:
@@ -2074,6 +2245,29 @@ class Hub:
                 except OpError:
                     return {"models": [], "commands": [], "modes": list(CODEX_MODES)}
             return {"models": self.codex.models, "commands": [], "modes": ["untrusted", "auto", "readOnly", "full"]}
+        raise OpError("bad_agent", str(agent))
+
+    async def op_agent_commands(self, client, req):
+        agent = req.get("agent")
+        cwd = req.get("cwd") or HOME
+        reload = bool(req.get("reload"))
+        if agent == "claude":
+            lock = self.probe_locks.setdefault(cwd, asyncio.Lock())
+            async with lock:
+                cached = self.claude_cmds.get(cwd)
+                if cached and not reload and time.time() - cached[0] < COMMANDS_TTL:
+                    return {"commands": cached[1]}
+                try:
+                    await self.claude_probe(cwd)
+                except OpError:
+                    if not self.claude_info.get("commands"):
+                        raise
+                    return {"commands": self.claude_info["commands"]}
+                return {"commands": self.claude_cmds[cwd][1]}
+        if agent == "codex":
+            skills = await self.codex_skill_list(cwd, force=reload)
+            return {"commands": [{"name": s["name"], "description": s["description"], "argumentHint": "",
+                                  "kind": "skill"} for s in skills]}
         raise OpError("bad_agent", str(agent))
 
     async def op_ping(self, client, req):

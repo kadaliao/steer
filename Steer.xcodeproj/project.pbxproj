@@ -19,6 +19,7 @@
 		60A907D6E745CD578C1248C0 /* HeelerSSH in Frameworks */ = {isa = PBXBuildFile; productRef = C150A1B30000132CA999BCB7 /* HeelerSSH */; };
 		761DD389B03A3F8ECAE381AC /* PlainPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 900F3C93CC7860EC46CCDF6B /* PlainPreview.swift */; };
 		84FFFCE0D9CB40AE6E79E520 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = EF2F38CD51D287797FB0C7EC /* Assets.xcassets */; };
+		85DBC06EABF0BAD145EE9338 /* HostConnection.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2802F7247B69A5D39614D3E /* HostConnection.swift */; };
 		8BF7300CBFB37E88B750631C /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = ED804AE3F5C80A9801CA88EB /* PrivacyInfo.xcprivacy */; };
 		9027E814685D8C1511A48B15 /* Wire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98E62C0DEE7E6B6956DB0118 /* Wire.swift */; };
 		B5CE8415375C1F468282728A /* Keys.swift in Sources */ = {isa = PBXBuildFile; fileRef = F33ED03F8D383E1408A15FF1 /* Keys.swift */; };
@@ -78,6 +79,7 @@
 		B4A7684C751FB4A21CB9CF1B /* ChatModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatModel.swift; sourceTree = "<group>"; };
 		B6C3148BDC452FF92D86EC7F /* SteerUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = SteerUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		C2C3AAA715AC30C47F00B24E /* SessionListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionListView.swift; sourceTree = "<group>"; };
+		D2802F7247B69A5D39614D3E /* HostConnection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HostConnection.swift; sourceTree = "<group>"; };
 		D8063355C0850C59D2F7C8B4 /* MarkdownText.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownText.swift; sourceTree = "<group>"; };
 		D8651F060FD03E2D32AF3D6F /* DiffView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiffView.swift; sourceTree = "<group>"; };
 		ED804AE3F5C80A9801CA88EB /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
@@ -137,6 +139,7 @@
 				B4A7684C751FB4A21CB9CF1B /* ChatModel.swift */,
 				0F729BCD2F32840A1D9286FA /* HelperLink.swift */,
 				A47CCA973C46F452BD3B58DC /* HostConfig.swift */,
+				D2802F7247B69A5D39614D3E /* HostConnection.swift */,
 				900F3C93CC7860EC46CCDF6B /* PlainPreview.swift */,
 				A5ED9B90DC1BC99D5BB031D7 /* Presentation.swift */,
 			);
@@ -358,6 +361,7 @@
 				149CABABF62C35F181D62E95 /* DiffView.swift in Sources */,
 				D9BE93944388D43DC1FA6D24 /* HelperLink.swift in Sources */,
 				EE9FC5126F5DC723A5A61B44 /* HostConfig.swift in Sources */,
+				85DBC06EABF0BAD145EE9338 /* HostConnection.swift in Sources */,
 				3A82A778D4C2007E4D6270A1 /* HostViews.swift in Sources */,
 				ECABB8D1C7C8FA531FE274C9 /* JSONValue.swift in Sources */,
 				B5CE8415375C1F468282728A /* Keys.swift in Sources */,
@@ -462,7 +466,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
-				MARKETING_VERSION = 0.1.0;
+				MARKETING_VERSION = 0.2.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -525,7 +529,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
-				MARKETING_VERSION = 0.1.0;
+				MARKETING_VERSION = 0.2.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";

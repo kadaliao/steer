@@ -104,12 +104,12 @@ actor HelperLink {
             """)
         let reported = installed.trimmingCharacters(in: .whitespacesAndNewlines)
         if reported == "NO_PYTHON" { throw LinkError.pythonMissing }
-        if reported != helperVersion {
+        if reported == "MISSING" || Self.isVersion(reported, olderThan: helperVersion) {
             await progress(String(localized: "安装主机助手…"))
             let result = try await ssh.execute(
                 Self.sh("""
-                    mkdir -p "\(Self.helperDir)" && cat > "\(Self.helperDir)/steerd.py.tmp" && \
-                    mv "\(Self.helperDir)/steerd.py.tmp" "\(Self.helperDir)/steerd.py" && echo OK
+                    mkdir -p "\(Self.helperDir)" && cat > "\(Self.helperDir)/steerd.py.tmp.$$" && \
+                    mv "\(Self.helperDir)/steerd.py.tmp.$$" "\(Self.helperDir)/steerd.py" && echo OK
                     """),
                 input: helperScript, timeout: .seconds(30))
             guard String(decoding: result.stdout, as: UTF8.self).contains("OK") else {
@@ -131,7 +131,8 @@ actor HelperLink {
         }
         self.channel = channel
         startPumps(channel)
-        let hello: HelloInfo = try await call("hello", ["app": "0.1.0"], timeout: .seconds(40))
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+        let hello: HelloInfo = try await call("hello", ["app": .string(version)], timeout: .seconds(40))
         return hello
     }
 
@@ -146,6 +147,19 @@ actor HelperLink {
 
     /// Wraps a POSIX sh script so it runs the same under fish, zsh or bash
     /// login shells. Scripts must not contain single quotes.
+    /// Compares dotted version numbers. A newer helper is left alone: it
+    /// only adds fields and ops, so an older app keeps working with it.
+    static func isVersion(_ a: String, olderThan b: String) -> Bool {
+        let left = a.split(separator: ".").map { Int($0) ?? 0 }
+        let right = b.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(left.count, right.count) {
+            let x = i < left.count ? left[i] : 0
+            let y = i < right.count ? right[i] : 0
+            if x != y { return x < y }
+        }
+        return false
+    }
+
     static func sh(_ script: String) -> String {
         "/bin/sh -c '" + script + "'"
     }

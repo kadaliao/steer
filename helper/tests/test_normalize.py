@@ -23,7 +23,7 @@ class FakeHub:
     def session_changed(self, s, quiet=False, urgent=False):
         pass
 
-    def remember_claude_info(self, info):
+    def remember_claude_info(self, info, cwd=None):
         pass
 
     def remember_claude_commands(self, names):
@@ -239,6 +239,54 @@ class SmallHelpersTests(unittest.TestCase):
 
     def test_stable_path_drops_per_shell_entries(self):
         self.assertEqual(steerd.stable_path("/a:/x/fnm_multishells/1/bin:/b:/a"), "/a:/b")
+
+
+class SuggestionAndCommandTests(unittest.TestCase):
+    def test_prompt_suggestion_shows_only_while_idle(self):
+        hub = FakeHub()
+        s = steerd.ClaudeSession(hub, {"sid": "s1", "cwd": "/tmp"})
+        s.on_message({"type": "prompt_suggestion", "suggestion": "run the tests"})
+        self.assertEqual(s.summary()["suggestion"], "run the tests")
+        s.set_state("running")
+        self.assertIsNone(s.summary()["suggestion"])
+        s.set_state("idle")
+        self.assertIsNone(s.summary()["suggestion"])
+
+    def test_suggestion_ignored_while_running(self):
+        s = steerd.ClaudeSession(FakeHub(), {"sid": "s2", "cwd": "/tmp"})
+        s.set_state("running")
+        s.on_message({"type": "prompt_suggestion", "suggestion": "late"})
+        s.set_state("idle")
+        self.assertIsNone(s.summary()["suggestion"])
+
+    def test_claude_commands_put_skills_first(self):
+        info = {"commands": [
+            {"name": "compact", "description": "Free up context", "argumentHint": "<x>", "builtin": True},
+            {"name": "deep-research", "description": "Research (user)", "argumentHint": ""},
+        ]}
+        out = steerd.claude_command_list(info)
+        self.assertEqual([c["name"] for c in out], ["deep-research", "compact"])
+        self.assertEqual([c["kind"] for c in out], ["skill", "builtin"])
+
+    def test_open_terminal_sessions_need_a_live_interactive_pid(self):
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as root:
+            entries = {
+                "1.json": {"pid": os.getpid(), "sessionId": "live", "kind": "interactive", "entrypoint": "cli"},
+                "2.json": {"pid": os.getpid(), "sessionId": "sdk", "kind": "sdk"},
+                "5.json": {"pid": os.getpid(), "sessionId": "print", "kind": "interactive", "entrypoint": "sdk-cli"},
+                "3.json": {"pid": 2 ** 22 + 7, "sessionId": "gone", "kind": "interactive"},
+            }
+            for name, d in entries.items():
+                with open(os.path.join(root, name), "w") as f:
+                    json.dump(d, f)
+            with open(os.path.join(root, "4.json"), "w") as f:
+                f.write("{broken")
+            self.assertEqual(steerd.claude_open_sessions(root), {"live": os.getpid()})
+
+    def test_skill_mentions(self):
+        found = steerd.SKILL_MENTION.findall("use $pdf and $skill-creator. not a$b or $$x, cost $5")
+        self.assertEqual([n.rstrip(".:-") for n in found], ["pdf", "skill-creator", "5"])
 
 
 if __name__ == "__main__":

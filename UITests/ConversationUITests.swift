@@ -20,14 +20,22 @@ final class ConversationUITests: XCTestCase {
             "-lastProject", project,
             "-lastModel.claude", "haiku", "-lastMode.claude", "default",
             "-lastModel.codex", "gpt-5.6-luna", "-lastMode.codex", "untrusted",
+            "-draft.new", "",
         ]
     }
 
     private func shot(_ name: String) {
-        let attachment = XCTAttachment(screenshot: app.screenshot())
+        let screenshot = app.screenshot()
+        let attachment = XCTAttachment(screenshot: screenshot)
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
+        // Also straight to a folder (TEST_RUNNER_STEER_UI_SHOTS), for runs whose result bundle never closes.
+        if let dir = ProcessInfo.processInfo.environment["STEER_UI_SHOTS"] {
+            let test = name.isEmpty ? "shot" : name
+            let file = URL(fileURLWithPath: dir).appendingPathComponent("\(self.name.split(separator: " ").last?.dropLast() ?? "test")-\(test).png")
+            try? screenshot.pngRepresentation.write(to: file)
+        }
     }
 
     private func waitEnabled(_ element: XCUIElement, timeout: TimeInterval) {
@@ -54,13 +62,24 @@ final class ConversationUITests: XCTestCase {
         XCTFail("turn \(count) did not finish")
     }
 
-    private func startChat(prompt: String) {
+    private var composer: XCUIElement { app.descendants(matching: .any)["composer"].firstMatch }
+
+    private func openNewChat() {
         let newChat = app.buttons["新会话"]
         waitEnabled(newChat, timeout: 60)
         shot("list")
         newChat.tap()
-        let composer = app.descendants(matching: .any)["composer"].firstMatch
         XCTAssertTrue(composer.waitForExistence(timeout: 10))
+    }
+
+    private func send(_ text: String) {
+        composer.tap()
+        composer.typeText(text)
+        app.buttons["send"].tap()
+    }
+
+    private func startChat(prompt: String) {
+        openNewChat()
         composer.tap()
         composer.typeText(prompt)
         shot("new-chat")
@@ -70,14 +89,42 @@ final class ConversationUITests: XCTestCase {
     func testClaudeConversation() throws {
         app.launchArguments += ["-lastAgent", "claude"]
         app.launch()
-        startChat(prompt: "Run ls, then add a function cube(x) to calc.py. Keep it minimal. Reply in one short sentence.")
+        openNewChat()
+
+        // "/" lists the project's commands and skills; the list can be closed.
+        composer.tap()
+        composer.typeText("/")
+        let close = app.buttons["closeSuggestions"]
+        XCTAssertTrue(close.waitForExistence(timeout: 10))
+        let anyCommand = app.buttons.matching(NSPredicate(format: "label BEGINSWITH '/'")).firstMatch
+        XCTAssertTrue(anyCommand.waitForExistence(timeout: 45), "no commands listed")
+        shot("commands")
+        composer.typeText("comp")
+        let compact = app.buttons.matching(NSPredicate(format: "label BEGINSWITH '/compact'")).firstMatch
+        XCTAssertTrue(compact.waitForExistence(timeout: 5), "built-in commands missing")
+        shot("commands-filtered")
+        close.tap()
+        XCTAssertFalse(close.waitForExistence(timeout: 2))
+        composer.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: 5))
+
+        // The keyboard can be put away.
+        app.buttons["hideKeyboard"].tap()
+        XCTAssertFalse(app.keyboards.firstMatch.waitForExistence(timeout: 2))
+
+        send("Run ls, then add a function cube(x) to calc.py. Keep it minimal. Reply in one short sentence.")
         sleep(6)
         shot("running")
         waitForTurns(1, timeout: 180)
         shot("first-turn")
 
-        // A quick phrase sends immediately.
-        app.buttons["解释一下改动"].tap()
+        // Claude's suggested next message sends in one tap, when it offers one.
+        let suggestion = app.buttons["replySuggestion"]
+        if suggestion.waitForExistence(timeout: 25) {
+            shot("suggestion")
+            suggestion.tap()
+        } else {
+            send("Explain the change in one sentence.")
+        }
         waitForTurns(2, timeout: 180)
         shot("second-turn")
 
@@ -99,10 +146,45 @@ final class ConversationUITests: XCTestCase {
         shot("list-after")
     }
 
+    /// Two hosts (the same Mac by two names): the home list shows both and
+    /// the title switches between them. Spends no usage.
+    func testTwoHosts() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let host = env["STEER_UI_HOST"], let at = host.firstIndex(of: "@") else { return }
+        let other = host[..<at] + "@localhost" + (host.contains(":") ? ":" + (host.split(separator: ":").last ?? "22") : "")
+        app.launchArguments += ["-steerSeedHost", String(other)]
+        app.launch()
+        let scope = app.buttons["hostScope"]
+        XCTAssertTrue(scope.waitForExistence(timeout: 30))
+        waitEnabled(app.buttons["新会话"], timeout: 60)
+        sleep(3)
+        shot("all-hosts")
+        scope.tap()
+        shot("scope-menu")
+        app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'localhost'")).firstMatch.tap()
+        sleep(1)
+        shot("one-host")
+        scope.tap()
+        app.buttons.matching(NSPredicate(format: "label BEGINSWITH '全部主机'")).firstMatch.tap()
+    }
+
     func testCodexConversation() throws {
         app.launchArguments += ["-lastAgent", "codex"]
         app.launch()
-        startChat(prompt: "Add a function square(x) to calc.py. Keep it minimal. Reply in one short sentence.")
+        openNewChat()
+
+        // "$" lists Codex skills.
+        composer.tap()
+        composer.typeText("$")
+        let close = app.buttons["closeSuggestions"]
+        XCTAssertTrue(close.waitForExistence(timeout: 10))
+        let skill = app.buttons.matching(NSPredicate(format: "label BEGINSWITH '$'")).firstMatch
+        XCTAssertTrue(skill.waitForExistence(timeout: 45), "no skills listed")
+        shot("skills")
+        close.tap()
+        composer.typeText(XCUIKeyboardKey.delete.rawValue)
+
+        send("Add a function square(x) to calc.py. Keep it minimal. Reply in one short sentence.")
         sleep(8)
         shot("running")
         waitForTurns(1, timeout: 240, approving: "本会话都允许")

@@ -1,7 +1,7 @@
 import SwiftUI
 
 enum Route: Hashable {
-    case chat(String)
+    case chat(UUID, String)
     case newChat
     case settings
 }
@@ -15,13 +15,13 @@ struct HomeView: View {
             SessionListView(open: { path.append($0) })
                 .navigationDestination(for: Route.self) { route in
                     switch route {
-                    case .chat(let sid):
-                        ChatScreen(sid: sid)
+                    case .chat(let hostID, let sid):
+                        ChatScreen(hostID: hostID, sid: sid)
                     case .newChat:
-                        NewChatView { sid in
+                        NewChatView { hostID, sid in
                             // Replace the draft screen with the new conversation.
                             if !path.isEmpty { path.removeLast() }
-                            path.append(.chat(sid))
+                            path.append(.chat(hostID, sid))
                         }
                     case .settings:
                         SettingsView()
@@ -36,18 +36,21 @@ struct SessionListView: View {
     let open: (Route) -> Void
     @State private var filter: String?
 
-    private var visible: [SessionSummary] {
-        app.sessions.filter { filter == nil || $0.cwd == filter }
+    private var visible: [HostedSession] {
+        app.sessions.filter { filter == nil || $0.summary.cwd == filter }
     }
 
-    private var needsYou: [SessionSummary] { visible.filter(\.isWaiting) }
-    private var rest: [SessionSummary] { visible.filter { !$0.isWaiting } }
+    private var needsYou: [HostedSession] { visible.filter(\.summary.isWaiting) }
+    private var rest: [HostedSession] { visible.filter { !$0.summary.isWaiting } }
+
+    /// Show which host a row is on when the list mixes hosts.
+    private var tagHosts: Bool { app.hasManyHosts && app.scope == nil }
 
     /// Projects with the most recent activity, for the filter chips.
     private var topProjects: [String] {
         var seen: [String] = []
-        for summary in app.sessions where !seen.contains(summary.cwd) {
-            seen.append(summary.cwd)
+        for hosted in app.sessions where !seen.contains(hosted.summary.cwd) {
+            seen.append(hosted.summary.cwd)
             if seen.count == 8 { break }
         }
         return seen
@@ -55,9 +58,11 @@ struct SessionListView: View {
 
     var body: some View {
         List {
-            ConnectionBanner()
-                .listRowSeparator(.hidden)
-                .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
+            ForEach(app.inScope) { conn in
+                ConnectionBanner(conn: conn, showName: app.hasManyHosts)
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
+            }
             if topProjects.count > 1 {
                 filterChips
                     .listRowSeparator(.hidden)
@@ -75,22 +80,27 @@ struct SessionListView: View {
             } header: {
                 if !needsYou.isEmpty { Text("其他") }
             }
-            if app.sessions.isEmpty, app.isConnected {
+            if app.sessions.isEmpty, app.anyConnected {
                 emptyState.listRowSeparator(.hidden)
             }
         }
         .listStyle(.plain)
-        .refreshable { await app.refreshSessions() }
-        .navigationTitle(app.activeHost?.displayName ?? "Steer")
+        .refreshable { await app.refreshAll() }
+        .navigationTitle(app.hasManyHosts ? "" : (app.ordered.first?.name ?? "Steer"))
+        .navigationBarTitleDisplayMode(app.hasManyHosts ? .inline : .large)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 Button { open(.settings) } label: { Image(systemName: "gearshape") }
+                    .accessibilityLabel("设置")
+            }
+            if app.hasManyHosts {
+                ToolbarItem(placement: .principal) { HostScopeMenu() }
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button { open(.newChat) } label: {
                     Image(systemName: "square.and.pencil").font(.body.weight(.semibold))
                 }
-                .disabled(!app.isConnected)
+                .disabled(!app.anyConnected)
             }
         }
         .overlay(alignment: .bottomTrailing) {
@@ -102,9 +112,10 @@ struct SessionListView: View {
                     .background(Circle().fill(Color.accentColor).shadow(color: .black.opacity(0.2), radius: 8, y: 3))
             }
             .padding(22)
-            .disabled(!app.isConnected)
+            .disabled(!app.anyConnected)
             .accessibilityLabel("新会话")
         }
+        .onChange(of: app.scope) { _, _ in filter = nil }
     }
 
     private var filterChips: some View {
@@ -133,19 +144,21 @@ struct SessionListView: View {
         .buttonStyle(.plain)
     }
 
-    private func row(_ summary: SessionSummary) -> some View {
-        Button {
-            open(.chat(summary.sid))
+    private func row(_ hosted: HostedSession) -> some View {
+        let summary = hosted.summary
+        let conn = app.connection(hosted.hostID)
+        return Button {
+            open(.chat(hosted.hostID, summary.sid))
         } label: {
-            SessionRow(summary: summary, unread: app.isUnread(summary))
+            SessionRow(summary: summary, unread: app.isUnread(summary), hostName: tagHosts ? conn?.name : nil)
         }
         .swipeActions(edge: .trailing) {
             Button(role: .destructive) {
-                Task { await app.archive(summary) }
+                Task { await conn?.archive(summary) }
             } label: { Label("归档", systemImage: "archivebox") }
-            if summary.isRunning {
+            if summary.isRunning, let conn {
                 Button {
-                    Task { await app.chat(for: summary).interrupt() }
+                    Task { await conn.chat(for: summary).interrupt() }
                 } label: { Label("停止", systemImage: "stop.circle") }
                 .tint(.orange)
             }
@@ -164,9 +177,59 @@ struct SessionListView: View {
     }
 }
 
+/// The title of the home screen when there are several hosts: shows which
+/// hosts are listed and switches between all of them and one.
+struct HostScopeMenu: View {
+    @Environment(AppModel.self) private var app
+
+    var body: some View {
+        Menu {
+            Button {
+                app.scope = nil
+            } label: {
+                if app.scope == nil {
+                    Label("全部主机", systemImage: "checkmark")
+                } else {
+                    Text("全部主机")
+                }
+            }
+            Divider()
+            ForEach(app.ordered) { conn in
+                Button {
+                    app.scope = conn.id
+                } label: {
+                    if app.scope == conn.id {
+                        Label(conn.name, systemImage: "checkmark")
+                    } else {
+                        Text(conn.name)
+                    }
+                    Text(HostStatusText.text(conn.status))
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                if let conn = app.connection(app.scope) {
+                    StatusDot(status: conn.status)
+                    Text(conn.name)
+                } else {
+                    HStack(spacing: 2) {
+                        ForEach(app.ordered) { StatusDot(status: $0.status) }
+                    }
+                    Text("全部主机")
+                }
+                Image(systemName: "chevron.down").font(.system(size: 10, weight: .bold)).opacity(0.6)
+            }
+            .font(.headline)
+            .foregroundStyle(.primary)
+        }
+        .accessibilityIdentifier("hostScope")
+    }
+}
+
 struct SessionRow: View {
     let summary: SessionSummary
     let unread: Bool
+    var hostName: String?
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -181,6 +244,12 @@ struct SessionRow: View {
                     SessionStatus(summary: summary, unread: unread)
                 }
                 HStack(spacing: 6) {
+                    if let hostName {
+                        Label(hostName, systemImage: "desktopcomputer")
+                            .labelStyle(.titleAndIcon)
+                            .font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                        Text("·").font(.caption).foregroundStyle(.tertiary)
+                    }
                     Text(summary.projectName).font(.caption.weight(.medium)).foregroundStyle(.secondary)
                     if summary.isDesktop {
                         Text("电脑上").font(.caption2).padding(.horizontal, 5).padding(.vertical, 1)
@@ -188,6 +257,7 @@ struct SessionRow: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+                .lineLimit(1)
                 if let subtitle, !subtitle.isEmpty {
                     Text(subtitle).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
                 }

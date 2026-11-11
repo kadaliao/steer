@@ -22,7 +22,7 @@ process elsewhere) and relays stdin/stdout to its Unix socket
 | `session.open` | `sid`, `agent`, `cwd`, `title` (for desktop sessions) | snapshot: `session`, `items[]` (last 400), `earlier`, `requests[]`; then live events for it |
 | `session.close` | `sid` | stops live events for it |
 | `session.create` | `agent`, `cwd`, `text`, `images`, `model?`, `mode?` | `session`; sends the first message when given |
-| `session.send` | `sid`, `text`, `images[{mime, data(base64)}]` | `id` of the new user item. While running: Codex steers, Claude queues |
+| `session.send` | `sid`, `text`, `images[{mime, data(base64)}]` | `id` of the new user item. While running: Codex steers, Claude queues. Codex: each `$name` naming a skill also attaches that skill |
 | `session.interrupt` | `sid` | — |
 | `session.respond` | `sid`, `rid`, `decision` (`allow`/`allowSession`/`deny`), `message`, `answers{questionId: label \| [labels]}` | — |
 | `session.setMode` / `session.setModel` | `sid`, `mode` / `model` | `session` |
@@ -31,7 +31,8 @@ process elsewhere) and relays stdin/stdout to its Unix socket
 | `files.search` | `cwd`, `query`, `limit` | `files[]` (relative paths, fuzzy ranked) |
 | `dirs.list` | `path` | `path`, `parent`, `entries[{name, path, git}]`, `git` |
 | `projects.recent` | — | `projects[{path, name, updatedAt, agents, git}]` |
-| `agent.info` | `agent` | `models[]`, `commands[]`, `modes[]` |
+| `agent.info` | `agent`, `cwd?` | `models[]`, `commands[]` (last known, any folder), `modes[]` |
+| `agent.commands` | `agent`, `cwd`, `reload?` | `commands[{name, description, argumentHint, kind (skill\|builtin)}]` for that folder: Claude's `initialize` list (a short-lived `claude -p` with hooks off, no message sent), Codex's `skills/list`. Cached 10 minutes |
 | `ping` | — | — |
 | `shutdown` | `force?` | refuses with `busy` while a session runs, unless forced |
 
@@ -56,7 +57,14 @@ appends to an assistant item's `text`.
 
 `sid, agent, cwd, title, state (idle|running|waiting), needs (permission|question|plan|null),
 lastText, activity{category,target}, updatedAt (ms), runningSince (ms), model, mode,
-source (steer|desktop), live, error`
+source (steer|desktop), live, error, suggestion, openInTerminal`
+
+- `suggestion`: Claude's predicted next user message (`--prompt-suggestions`),
+  present only while the session is idle; cleared when a turn starts.
+- `openInTerminal` (Claude only): a terminal on the host has this session open
+  right now, per Claude Code's registry `~/.claude/sessions/<pid>.json`
+  (`kind: interactive`, live pid). That process does not see what Steer adds
+  to the transcript until it is resumed again.
 
 ### Timeline items
 

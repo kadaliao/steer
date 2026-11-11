@@ -19,6 +19,10 @@ struct SessionSummary: Codable, Sendable, Identifiable, Equatable, Hashable {
     var source: String?
     var live: Bool?
     var error: String?
+    /// The agent's guess at the next message (Claude's prompt suggestion).
+    var suggestion: String?
+    /// Claude only: a terminal on the host has this session open right now.
+    var openInTerminal: Bool?
 
     var id: String { sid }
 
@@ -175,7 +179,13 @@ struct CommandOption: Decodable, Sendable, Identifiable, Hashable {
     var name: String
     var description: String?
     var argumentHint: String?
+    /// "skill" (skills and custom commands) or "builtin".
+    var kind: String?
     var id: String { name }
+}
+
+struct CommandList: Decodable, Sendable {
+    var commands: [CommandOption]
 }
 
 struct AgentInfo: Decodable, Sendable {

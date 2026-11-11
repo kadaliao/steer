@@ -90,18 +90,21 @@ struct SessionStatus: View {
     }
 }
 
+/// A host's link trouble or progress, shown above the session list. Tap a
+/// failure to retry.
 struct ConnectionBanner: View {
-    @Environment(AppModel.self) private var app
+    let conn: HostConnection
+    var showName = false
 
     var body: some View {
-        switch app.status {
+        switch conn.status {
         case .connected, .idle:
             EmptyView()
         case .connecting(let text):
             banner(text, systemImage: nil, tint: .secondary)
         case .failed(let text):
             Button {
-                Task { await app.connect() }
+                Task { await conn.connect() }
             } label: {
                 banner(text, systemImage: "exclamationmark.triangle.fill", tint: .orange)
             }
@@ -116,11 +119,49 @@ struct ConnectionBanner: View {
             } else {
                 ProgressView().controlSize(.small)
             }
-            Text(text).font(.footnote).foregroundStyle(.primary).lineLimit(3)
+            Group {
+                if showName {
+                    Text(conn.name).fontWeight(.semibold) + Text("：") + Text(text)
+                } else {
+                    Text(text)
+                }
+            }
+            .font(.footnote).foregroundStyle(.primary).lineLimit(3)
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemBackground)))
+    }
+}
+
+/// Green when connected, orange when failing, grey otherwise.
+struct StatusDot: View {
+    let status: LinkStatus
+
+    var body: some View {
+        Circle()
+            .fill(color)
+            .frame(width: 7, height: 7)
+    }
+
+    private var color: Color {
+        switch status {
+        case .connected: .green
+        case .failed: .orange
+        case .connecting: .yellow
+        case .idle: Color(.systemGray3)
+        }
+    }
+}
+
+enum HostStatusText {
+    static func text(_ status: LinkStatus) -> String {
+        switch status {
+        case .connected: String(localized: "已连接")
+        case .connecting: String(localized: "正在连接")
+        case .failed(let text): text
+        case .idle: String(localized: "未连接")
+        }
     }
 }

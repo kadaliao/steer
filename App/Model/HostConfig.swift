@@ -20,7 +20,7 @@ struct HostConfig: Codable, Sendable, Identifiable, Hashable {
     var passwordAccount: String { "password-" + id.uuidString }
 }
 
-/// Small persisted preferences: hosts, drafts, quick phrases, last choices.
+/// Small persisted preferences: hosts, drafts, last choices.
 @MainActor
 enum Prefs {
     private static let defaults = UserDefaults.standard
@@ -30,16 +30,16 @@ enum Prefs {
         set { encode(newValue, "hosts") }
     }
 
-    static var activeHostID: UUID? {
-        get { defaults.string(forKey: "activeHost").flatMap(UUID.init(uuidString:)) }
-        set { defaults.set(newValue?.uuidString, forKey: "activeHost") }
+    /// The host the home list is narrowed to; nil shows every host.
+    static var homeScope: UUID? {
+        get { defaults.string(forKey: "homeScope").flatMap(UUID.init(uuidString:)) }
+        set { defaults.set(newValue?.uuidString, forKey: "homeScope") }
     }
 
-    static let defaultPhrases = ["继续", "跑一下测试", "提交一下", "解释一下改动", "还有什么问题？"]
-
-    static var quickPhrases: [String] {
-        get { defaults.stringArray(forKey: "quickPhrases") ?? defaultPhrases }
-        set { defaults.set(newValue, forKey: "quickPhrases") }
+    /// The host the last new session was started on.
+    static var lastHostID: UUID? {
+        get { defaults.string(forKey: "lastHost").flatMap(UUID.init(uuidString:)) }
+        set { defaults.set(newValue?.uuidString, forKey: "lastHost") }
     }
 
     static var returnSends: Bool {
@@ -59,9 +59,14 @@ enum Prefs {
         }
     }
 
-    static var lastProject: String? {
-        get { defaults.string(forKey: "lastProject") }
-        set { defaults.set(newValue, forKey: "lastProject") }
+    /// The last project used on a host. `lastProject` alone is the fallback
+    /// (and what UI tests set).
+    static func lastProject(host: UUID) -> String? {
+        defaults.string(forKey: "lastProject." + host.uuidString) ?? defaults.string(forKey: "lastProject")
+    }
+
+    static func setLastProject(_ path: String, host: UUID) {
+        defaults.set(path, forKey: "lastProject." + host.uuidString)
     }
 
     static var lastAgent: String {
