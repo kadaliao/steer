@@ -137,6 +137,67 @@ struct HostEditorView: View {
     }
 }
 
+/// Whether the phone gets told when a turn it started ends or needs you.
+struct NotificationSection: View {
+    @Environment(AppModel.self) private var app
+    @State private var testResult: String?
+    @State private var testing = false
+
+    var body: some View {
+        Section {
+            switch app.notificationStatus {
+            case .authorized, .provisional, .ephemeral:
+                ForEach(app.ordered) { conn in
+                    LabeledContent(conn.name, value: pushText(conn))
+                }
+                Button(testing ? "正在发…" : "发一条测试通知") { test() }
+                    .disabled(testing || !app.ordered.contains { $0.pushReady == true })
+                if let testResult {
+                    Text(testResult).font(.footnote).foregroundStyle(.secondary)
+                }
+            case .denied:
+                Button("在系统设置里打开通知") {
+                    if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+                }
+            default:
+                Button("允许通知") { Task { await app.askForNotificationsIfNeeded() } }
+            }
+        } header: {
+            Text("通知")
+        } footer: {
+            Text("手机上发起的任务做完、需要你批准或回答、出错时，电脑直接通过 Apple 推送通知你，不经过别的服务器。")
+        }
+        .task { await app.refreshNotificationStatus() }
+    }
+
+    private func pushText(_ conn: HostConnection) -> String {
+        switch conn.pushReady {
+        case true: String(localized: "能推送")
+        case false: String(localized: "电脑上还没有推送密钥")
+        default: conn.isConnected ? String(localized: "还没拿到推送权限") : String(localized: "未连接")
+        }
+    }
+
+    private func test() {
+        testing = true
+        testResult = nil
+        Task {
+            var lines: [String] = []
+            for conn in app.ordered where conn.pushReady == true {
+                do {
+                    let result = try await conn.sendTestPush()
+                    lines.append(result.sent > 0 ? String(localized: "\(conn.name)：已发出")
+                                 : String(localized: "\(conn.name)：没发出去 \(result.errors.joined(separator: ", "))"))
+                } catch {
+                    lines.append("\(conn.name)：\(error.localizedDescription)")
+                }
+            }
+            testResult = lines.joined(separator: "\n")
+            testing = false
+        }
+    }
+}
+
 /// A host's link state and what runs there.
 struct HostStatusSection: View {
     let conn: HostConnection
@@ -192,6 +253,7 @@ struct SettingsView: View {
             } footer: {
                 Text("所有主机同时保持连接，首页可以看全部，也可以只看一台。")
             }
+            NotificationSection()
             Section {
                 Toggle("回车直接发送", isOn: $returnSends)
                     .onChange(of: returnSends) { _, value in Prefs.returnSends = value }

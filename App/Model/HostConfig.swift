@@ -42,6 +42,11 @@ enum Prefs {
         set { defaults.set(newValue?.uuidString, forKey: "lastHost") }
     }
 
+    static var pushToken: String? {
+        get { defaults.string(forKey: "pushToken") }
+        set { defaults.set(newValue, forKey: "pushToken") }
+    }
+
     static var returnSends: Bool {
         get { defaults.bool(forKey: "returnSends") }
         set { defaults.set(newValue, forKey: "returnSends") }

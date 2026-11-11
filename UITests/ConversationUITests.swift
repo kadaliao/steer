@@ -38,6 +38,15 @@ final class ConversationUITests: XCTestCase {
         }
     }
 
+    /// The whole screen, springboard included (banners are not the app's).
+    private func screen(_ name: String) {
+        let screenshot = XCUIScreen.main.screenshot()
+        add(XCTAttachment(screenshot: screenshot))
+        if let dir = ProcessInfo.processInfo.environment["STEER_UI_SHOTS"] {
+            try? screenshot.pngRepresentation.write(to: URL(fileURLWithPath: dir).appendingPathComponent("\(self.name.split(separator: " ").last?.dropLast() ?? "test")-\(name).png"))
+        }
+    }
+
     private func waitEnabled(_ element: XCUIElement, timeout: TimeInterval) {
         let predicate = NSPredicate(format: "exists == true AND enabled == true")
         let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
@@ -190,4 +199,41 @@ final class ConversationUITests: XCTestCase {
         waitForTurns(1, timeout: 240, approving: "本会话都允许")
         shot("first-turn")
     }
+
+    /// Real APNs (sandbox) to the Simulator: a test push from Settings, then a
+    /// turn started from the app that ends while the app is in the background.
+    /// Tapping its notification opens the session. Needs the helper's APNs key.
+    func testPushNotifications() throws {
+        app.launchArguments += ["-lastAgent", "claude"]
+        app.launch()
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let allow = springboard.buttons.matching(NSPredicate(format: "label IN {'允许', 'Allow'}")).firstMatch
+        waitEnabled(app.buttons["新会话"], timeout: 60)
+        if allow.waitForExistence(timeout: 10) { allow.tap() }
+        sleep(4)
+
+        app.buttons["设置"].tap()
+        let test = app.buttons["发一条测试通知"]
+        waitEnabled(test, timeout: 30)
+        test.tap()
+        let banner = springboard.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS '测试通知'")).firstMatch
+        let found = banner.waitForExistence(timeout: 30)
+        screen("test-push")
+        XCTAssertTrue(found, "no test notification")
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+
+        startChat(prompt: "Reply with the single word pushed.")
+        sleep(2)
+        XCUIDevice.shared.press(.home)
+        let done = springboard.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS '做完了'")).firstMatch
+        let arrived = done.waitForExistence(timeout: 120)
+        screen("done-banner")
+        XCTAssertTrue(arrived, "no turn-finished notification")
+        done.tap()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+        let reply = app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] 'pushed'")).firstMatch
+        XCTAssertTrue(reply.waitForExistence(timeout: 20), "the notification did not open the session")
+        shot("opened-from-push")
+    }
 }
+

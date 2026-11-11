@@ -152,6 +152,8 @@ struct HelloInfo: Decodable, Sendable, Equatable {
     var python: String?
     var launchd: String?
     var agents: [String: AgentPresence?]
+    /// The helper has an APNs key and can notify this phone.
+    var push: Bool?
 
     func has(_ agent: String) -> Bool {
         (agents[agent] ?? nil) != nil
@@ -224,6 +226,15 @@ struct FileList: Decodable, Sendable {
 }
 
 struct Empty: Decodable, Sendable {}
+
+struct PushRegistration: Decodable, Sendable {
+    var configured: Bool
+}
+
+struct PushTestResult: Decodable, Sendable {
+    var sent: Int
+    var errors: [String]
+}
 
 /// A pushed event: `ev` names the kind; the other fields depend on it.
 struct EventFrame: Decodable, Sendable {

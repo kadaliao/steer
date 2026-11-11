@@ -224,3 +224,14 @@ iPhone App ──SSH──▶ 主机
 - 新版助手装上时如果旧的正忙，App 每 30 秒问一次，旧的空下来就换新的；只有小助手自己手里的活
   （它起的 Claude 进程、待回答的请求、交接中）才会让它拒绝退出。
 
+## 第四轮（2026-11-11）：推送
+
+- 手机上发起的那一轮做完、需要批准或回答、出错时推送；终端里你自己跑的不推送。
+- 不经过任何中继：主机助手用团队的 APNs 密钥（`N7G3K4DTMB`，Sandbox & Production，团队范围）
+  自己签 JWT（系统 openssl），用系统 curl 的 HTTP/2 直接发给 APNs。密钥放在每台电脑的
+  `~/.local/share/steer/apns/`，备份在 `~/.private_keys/`。
+- App 把设备 token 连同"这台主机在 App 里的 id"登记给每台电脑的助手，点通知直接进那个会话；
+  正在看的那个会话不弹横幅。Xcode 装的调试版走沙盒，TestFlight / App Store 版走正式环境。
+- 模拟器（Apple 芯片）能收真推送，端到端测试 `testPushNotifications` 用的就是它；模拟器的
+  apsd 偶尔连不上推送服务器（日志里 “Connected on 0 interfaces”），重启模拟器就好。
+

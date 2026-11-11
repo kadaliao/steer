@@ -2,6 +2,7 @@ import SwiftUI
 
 @main
 struct SteerApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @State private var app: AppModel
     @Environment(\.scenePhase) private var scenePhase
 
@@ -10,6 +11,7 @@ struct SteerApp: App {
         #if DEBUG
         DebugLaunch.apply(to: app)
         #endif
+        AppDelegate.model = app
         _app = State(initialValue: app)
     }
 

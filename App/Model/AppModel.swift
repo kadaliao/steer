@@ -1,6 +1,8 @@
 import Foundation
 import Observation
 import SwiftUI
+import UIKit
+import UserNotifications
 
 /// App-wide state: the hosts, one live connection per host, and which hosts
 /// the home list shows.
@@ -17,6 +19,28 @@ final class AppModel {
     var seen: [String: Double] = Prefs.seen
     var isActive = true
     let keychain = Keychain(service: "com.kadaliao.steer")
+
+    /// This phone's APNs device token, once iOS hands it over.
+    var pushToken: String? = Prefs.pushToken
+    var notificationStatus: UNAuthorizationStatus = .notDetermined
+    /// The session on screen; its notifications are not shown as banners.
+    private(set) var visibleChat: String?
+
+    func setVisibleChat(_ sid: String?) {
+        visibleChat = sid
+        AppDelegate.visibleChat.withLock { $0 = sid }
+    }
+    /// Where a tapped notification wants to go.
+    var pendingRoute: Route?
+
+    /// "sandbox" for builds Xcode installs, "production" for TestFlight / App Store.
+    static var pushEnvironment: String {
+        #if DEBUG
+        "sandbox"
+        #else
+        "production"
+        #endif
+    }
 
     init() {
         for host in hosts {
@@ -134,6 +158,51 @@ final class AppModel {
         for conn in ordered {
             Task { await conn.resume() }
         }
+        Task { await refreshNotificationStatus() }
+    }
+
+    // MARK: notifications
+
+    /// Asks once, after the first host connects: notifications only make
+    /// sense once there is something to be told about.
+    func askForNotificationsIfNeeded() async {
+        await refreshNotificationStatus()
+        #if DEBUG
+        print("STEER notifications status \(notificationStatus.rawValue), token \(pushToken == nil ? "none" : "saved")")
+        #endif
+        switch notificationStatus {
+        case .notDetermined:
+            let granted = (try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge])) ?? false
+            await refreshNotificationStatus()
+            if granted { UIApplication.shared.registerForRemoteNotifications() }
+        case .authorized, .provisional, .ephemeral:
+            UIApplication.shared.registerForRemoteNotifications()
+        default:
+            break
+        }
+    }
+
+    func refreshNotificationStatus() async {
+        notificationStatus = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+    }
+
+    func pushTokenReceived(_ token: String) {
+        #if DEBUG
+        print("STEER push token received")
+        #endif
+        pushToken = token
+        Prefs.pushToken = token
+        for conn in ordered where conn.isConnected {
+            Task { await conn.registerPush() }
+        }
+    }
+
+    func openFromNotification(host: String?, sid: String?) {
+        guard let sid else { return }
+        let id = host.flatMap(UUID.init(uuidString:))
+        let conn = connection(id) ?? ordered.first { $0.sessions.contains { $0.sid == sid } } ?? ordered.first
+        guard let conn else { return }
+        pendingRoute = .chat(conn.id, sid)
     }
 
     // MARK: unread

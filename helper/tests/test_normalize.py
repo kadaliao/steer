@@ -29,6 +29,9 @@ class FakeHub:
     def remember_claude_commands(self, names):
         pass
 
+    def notify(self, title, body, sid):
+        self.notified = getattr(self, "notified", []) + [(title, body, sid)]
+
 
 def claude_session():
     hub = FakeHub()
@@ -362,6 +365,38 @@ class TerminalSyncTests(unittest.TestCase):
         self.assertEqual(s.state, "idle")
         s.follow_terminal(None)
         self.assertIsNone(s.terminal)
+
+
+class PushTests(unittest.TestCase):
+    def test_der_signature_becomes_raw_r_and_s(self):
+        r, s_ = b"\x00" + b"\x81" * 32, b"\x05" * 31          # r with a sign byte, s one byte short
+        der = b"\x30" + bytes([4 + len(r) + len(s_)]) + b"\x02" + bytes([len(r)]) + r + b"\x02" + bytes([len(s_)]) + s_
+        raw = steerd.der_ecdsa_to_raw(der)
+        self.assertEqual(len(raw), 64)
+        self.assertEqual(raw[:32], b"\x81" * 32)
+        self.assertEqual(raw[32:], b"\x00" + b"\x05" * 31)
+
+    def test_only_turns_started_from_the_phone_notify(self):
+        hub = FakeHub()
+        s = steerd.ClaudeSession(hub, {"sid": "p1", "agent": "claude", "cwd": "/work/shop", "title": "fix cart"})
+        s.last_text = "Tests pass."
+        s.turn_finished("completed")                       # a terminal turn: nothing
+        self.assertFalse(getattr(hub, "notified", []))
+        s.phone_turn = True
+        s.add_request("r1", {"kind": "permission", "target": "npm test"}, {})
+        s.turn_finished("completed")
+        self.assertEqual(hub.notified, [("shop · fix cart", "等你批准：npm test", "p1"),
+                                        ("shop · fix cart", "做完了：Tests pass.", "p1")])
+        s.turn_finished("completed")                       # only once per phone turn
+        self.assertEqual(len(hub.notified), 2)
+
+    def test_interrupted_turns_stay_quiet(self):
+        hub = FakeHub()
+        s = steerd.CodexSession(hub, {"sid": "p2", "agent": "codex", "cwd": "/w"})
+        s.phone_turn = True
+        s.turn_finished("interrupted")
+        self.assertFalse(getattr(hub, "notified", []))
+        self.assertFalse(s.phone_turn)
 
 
 if __name__ == "__main__":

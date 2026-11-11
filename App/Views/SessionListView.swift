@@ -28,6 +28,11 @@ struct HomeView: View {
                     }
                 }
         }
+        .onChange(of: app.pendingRoute) { _, route in
+            guard let route else { return }
+            path = [route]
+            app.pendingRoute = nil
+        }
     }
 }
 

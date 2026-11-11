@@ -25,6 +25,18 @@ Steer 通过 SSH 登录你的电脑，在那里运行 Claude Code / Codex，手�
   卸载：`launchctl bootout gui/$(id -u)/com.kadaliao.steer.helper`，然后删除
   `~/Library/LaunchAgents/com.kadaliao.steer.helper.plist` 和 `~/.local/share/steer`。
 
+## 推送通知（可选）
+
+手机上发起的任务做完、需要你批准或回答时，电脑直接通过 Apple 推送通知你。每台电脑装一次
+团队的 APNs 密钥（Apple 开发者后台 › Keys，勾 Apple Push Notifications service，环境选
+Sandbox & Production）：
+
+```sh
+python3 ~/.local/share/steer/steerd.py push-key AuthKey_<Key ID>.p8 <Key ID> <Team ID>
+```
+
+App 第一次连上电脑时会请求通知权限，设置页里可以发一条测试通知。
+
 ## 开发
 
 ```sh

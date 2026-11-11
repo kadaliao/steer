@@ -23,6 +23,7 @@
 		8BF7300CBFB37E88B750631C /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = ED804AE3F5C80A9801CA88EB /* PrivacyInfo.xcprivacy */; };
 		9027E814685D8C1511A48B15 /* Wire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98E62C0DEE7E6B6956DB0118 /* Wire.swift */; };
 		B5CE8415375C1F468282728A /* Keys.swift in Sources */ = {isa = PBXBuildFile; fileRef = F33ED03F8D383E1408A15FF1 /* Keys.swift */; };
+		B60C7065C34A8CA1C866D7A3 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30A0BA928ADACD42EBD11300 /* AppDelegate.swift */; };
 		BD5D681DA5A68274B77FB352 /* steerd.py in Resources */ = {isa = PBXBuildFile; fileRef = 49C85781100733FFE3120593 /* steerd.py */; };
 		C33C283AE63FD302DAB9AB12 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FE682900FE7F38A2163B878 /* AppModel.swift */; };
 		C4CB74FAFD6DCA85F22842F1 /* SteerApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB4DBB998503A23F436C375C /* SteerApp.swift */; };
@@ -56,6 +57,7 @@
 
 /* Begin PBXFileReference section */
 		0F729BCD2F32840A1D9286FA /* HelperLink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HelperLink.swift; sourceTree = "<group>"; };
+		30A0BA928ADACD42EBD11300 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		3C5C8BCA6115ADFF8173A918 /* TimelineRows.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TimelineRows.swift; sourceTree = "<group>"; };
 		49C85781100733FFE3120593 /* steerd.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = steerd.py; sourceTree = "<group>"; };
 		4FA541D19CFE6DF8B947E6A7 /* HeelerSSH */ = {isa = PBXFileReference; lastKnownFileType = folder; name = HeelerSSH; path = Packages/HeelerSSH; sourceTree = SOURCE_ROOT; };
@@ -79,6 +81,7 @@
 		B4A7684C751FB4A21CB9CF1B /* ChatModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatModel.swift; sourceTree = "<group>"; };
 		B6C3148BDC452FF92D86EC7F /* SteerUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = SteerUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		C2C3AAA715AC30C47F00B24E /* SessionListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionListView.swift; sourceTree = "<group>"; };
+		CE7E120BA3D5B3A55471B2F3 /* Steer.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Steer.entitlements; sourceTree = "<group>"; };
 		D2802F7247B69A5D39614D3E /* HostConnection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HostConnection.swift; sourceTree = "<group>"; };
 		D8063355C0850C59D2F7C8B4 /* MarkdownText.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownText.swift; sourceTree = "<group>"; };
 		D8651F060FD03E2D32AF3D6F /* DiffView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiffView.swift; sourceTree = "<group>"; };
@@ -107,6 +110,7 @@
 				EF2F38CD51D287797FB0C7EC /* Assets.xcassets */,
 				FDD9F5779EBF460D2921B4EA /* Info.plist */,
 				ED804AE3F5C80A9801CA88EB /* PrivacyInfo.xcprivacy */,
+				CE7E120BA3D5B3A55471B2F3 /* Steer.entitlements */,
 				AB4DBB998503A23F436C375C /* SteerApp.swift */,
 				765897AAF9346DF15EF4856D /* Model */,
 				C211DE0CE1D195407D362FAD /* Support */,
@@ -177,6 +181,7 @@
 		C211DE0CE1D195407D362FAD /* Support */ = {
 			isa = PBXGroup;
 			children = (
+				30A0BA928ADACD42EBD11300 /* AppDelegate.swift */,
 				7690CBA84276D0DA2A3057F3 /* DebugLaunch.swift */,
 				65142798EC4E3D2C99CAA5D5 /* JSONValue.swift */,
 				F33ED03F8D383E1408A15FF1 /* Keys.swift */,
@@ -352,6 +357,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B60C7065C34A8CA1C866D7A3 /* AppDelegate.swift in Sources */,
 				C33C283AE63FD302DAB9AB12 /* AppModel.swift in Sources */,
 				FCCC6266DC572B5E8C69626B /* ChatModel.swift in Sources */,
 				CC5A7B4E35C0F445AF7B4C84 /* ChatView.swift in Sources */,
@@ -466,7 +472,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
-				MARKETING_VERSION = 0.3.0;
+				MARKETING_VERSION = 0.4.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -529,7 +535,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
-				MARKETING_VERSION = 0.3.0;
+				MARKETING_VERSION = 0.4.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -597,6 +603,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = App/Steer.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				INFOPLIST_FILE = App/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -614,6 +621,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = App/Steer.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				INFOPLIST_FILE = App/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (

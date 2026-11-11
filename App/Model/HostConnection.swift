@@ -26,6 +26,9 @@ final class HostConnection: Identifiable {
     var sessions: [SessionSummary] = []
     var projects: [ProjectEntry] = []
     var agentInfo: [String: AgentInfo] = [:]
+    /// Whether this host's helper can push to this phone (has an APNs key and
+    /// knows the device token).
+    var pushReady: Bool?
 
     private(set) var chats: [String: ChatModel] = [:]
     @ObservationIgnored private var commandCache: [String: (at: Date, list: [CommandOption])] = [:]
@@ -87,6 +90,15 @@ final class HostConnection: Identifiable {
             await refreshSessions(watch: true)
             for chat in chats.values where chat.isVisible {
                 await chat.load()
+            }
+            // Never let the permission prompt hold up the session list.
+            Task { [weak self] in
+                guard let self, let app = self.app else { return }
+                if app.pushToken != nil {
+                    await self.registerPush()
+                } else {
+                    await app.askForNotificationsIfNeeded()
+                }
             }
         } catch let LinkError.needsTrust(fingerprint) {
             status = .idle
@@ -204,6 +216,21 @@ final class HostConnection: Identifiable {
         } catch {
             // Keep what we had; the banner shows the link state.
         }
+    }
+
+    /// Gives the helper this phone's device token, tagged with this host's id
+    /// so a tapped notification knows where to go.
+    func registerPush() async {
+        guard let token = app?.pushToken else { return }
+        let result: PushRegistration? = try? await call("push.register", [
+            "token": .string(token), "env": .string(AppModel.pushEnvironment), "host": .string(id.uuidString),
+            "topic": .string(Bundle.main.bundleIdentifier ?? "com.kadaliao.steer"),
+        ])
+        pushReady = result?.configured
+    }
+
+    func sendTestPush() async throws -> PushTestResult {
+        try await call("push.test", timeout: .seconds(30))
     }
 
     func loadProjects() async {

@@ -72,12 +72,14 @@ struct ChatView: View {
         .navigationBarTitleDisplayMode(.inline)
         .task {
             chat.isVisible = true
+            app.setVisibleChat(chat.sid)
             text = Prefs.draft(chat.sid)
             await chat.load()
             info = await chat.conn?.info(for: chat.agent)
         }
         .onChange(of: text) { _, value in Prefs.setDraft(value, chat.sid) }
         .onDisappear {
+            if app.visibleChat == chat.sid { app.setVisibleChat(nil) }
             chat.close()
             app.markSeen(chat.summary)
         }

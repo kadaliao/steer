@@ -35,7 +35,7 @@ import sys
 import time
 import uuid
 
-VERSION = "0.3.2"
+VERSION = "0.4.0"
 PROTO = 1
 
 HOME = os.path.expanduser("~")
@@ -45,6 +45,8 @@ LOG_PATH = os.path.join(DATA_DIR, "steerd.log")
 META_DIR = os.path.join(DATA_DIR, "sessions")
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
 CACHE_PATH = os.path.join(DATA_DIR, "agent-info.json")
+PUSH_DEVICES = os.path.join(DATA_DIR, "push-devices.json")
+APNS_DIR = os.path.join(DATA_DIR, "apns")
 LABEL = "com.kadaliao.steer.helper"
 LINE_LIMIT = 256 * 1024 * 1024
 
@@ -910,6 +912,7 @@ class Session:
         self.error = None
         self.unsent = []
         self.suggestion = None  # the agent's guess at the next user message
+        self.phone_turn = False  # the running turn was started from Steer: tell the phone how it ends
 
     @property
     def sid(self) -> str:
@@ -1013,6 +1016,34 @@ class Session:
         self.pending[rid] = {"view": view, "raw": raw}
         self.hub.to_watchers(self.sid, {"ev": "request", "sid": self.sid, "request": view})
         self.touch()
+        if self.phone_turn:
+            kind = view.get("kind")
+            if kind == "question":
+                first = (view.get("questions") or [{}])[0]
+                body = "等你回答：" + one_line(first.get("question") or "", 120)
+            elif kind == "plan":
+                body = "等你批准计划"
+            else:
+                body = "等你批准：" + one_line(view.get("target") or view.get("detail") or view.get("tool") or "", 120)
+            self.hub.notify(self.push_title(), body, self.sid)
+
+    def push_title(self):
+        project = os.path.basename(self.cwd.rstrip("/")) or self.cwd
+        title = self.meta.get("title") or ""
+        return one_line("%s · %s" % (project, title) if title else project, 80)
+
+    def turn_finished(self, status, detail=""):
+        """Tell the phone how a turn it started ended."""
+        if not self.phone_turn:
+            return
+        self.phone_turn = False
+        if status == "interrupted":
+            return
+        if status == "error":
+            body = "出错了：" + one_line(detail or self.error or "", 140)
+        else:
+            body = "做完了" + ("：" + one_line(self.last_text, 140) if self.last_text else "")
+        self.hub.notify(self.push_title(), body, self.sid)
 
     def drop_request(self, rid):
         if self.pending.pop(rid, None) is not None:
@@ -1381,6 +1412,7 @@ class ClaudeSession(Session):
             detail = "\n".join(self.stderr_tail[-6:])
             self.notice("agent_exited", detail)
             self.set_state("idle", error=one_line(detail, 200) if detail else None)
+            self.turn_finished("error", detail or "Claude 退出了")
         else:
             self.set_state("idle")
 
@@ -1563,12 +1595,14 @@ class ClaudeSession(Session):
             return
         self.skip_transcript()
         self.set_state("idle")
+        self.turn_finished(status, detail)
         self.schedule_handback()
 
     # actions ---------------------------------------------------------
     async def send(self, text, images):
         await self.load()
         self.suggestion = None
+        self.phone_turn = True
         if self.handback_task:
             self.handback_task.cancel()
             self.handback_task = None
@@ -2162,6 +2196,7 @@ class CodexSession(Session):
                     item["streaming"] = False
                     self.emit_item(item)
             self.set_state("idle")
+            self.turn_finished(status, err.get("message") or "")
         elif method in ("item/started", "item/completed"):
             norm = codex_item(p.get("item") or {}, self.cwd, {})
             if norm:
@@ -2253,6 +2288,7 @@ class CodexSession(Session):
 
     async def send(self, text, images):
         await self.load()
+        self.phone_turn = True
         item_id = new_id("u")
         steering = self.state == "running" and self.turn_id is not None
         self.put({"id": item_id, "kind": "user", "text": text, "images": len(images or []), "queued": False})
@@ -2465,6 +2501,130 @@ def list_dirs(path: str):
 # Hub: clients, sessions, ops
 # ---------------------------------------------------------------------------
 
+def der_ecdsa_to_raw(der: bytes) -> bytes:
+    """openssl writes ECDSA signatures as DER; a JWT wants r and s side by side."""
+    i = 2 if der[1] < 0x80 else 2 + (der[1] & 0x7F)
+    parts = []
+    for _ in range(2):
+        if der[i] != 2:
+            raise ValueError("not an ECDSA signature")
+        n = der[i + 1]
+        parts.append(der[i + 2:i + 2 + n].lstrip(b"\0").rjust(32, b"\0"))
+        i += 2 + n
+    return parts[0] + parts[1]
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+class Pusher:
+    """Sends notifications straight to Apple's push service (APNs) with the
+    team's APNs key, using the system's openssl (ES256) and curl (HTTP/2):
+    no relay. The key lives in ~/.local/share/steer/apns/ (`steerd.py
+    push-key`); phones register their device tokens with `push.register`."""
+
+    def __init__(self):
+        self.devices = {}
+        self.jwt = (0.0, None, None)
+        try:
+            with open(PUSH_DEVICES) as f:
+                self.devices = json.load(f)
+        except Exception:
+            self.devices = {}
+
+    def config(self):
+        try:
+            with open(os.path.join(APNS_DIR, "apns.json")) as f:
+                cfg = json.load(f)
+        except Exception:
+            return None
+        key = os.path.join(APNS_DIR, "AuthKey_%s.p8" % cfg.get("keyId"))
+        if not cfg.get("keyId") or not cfg.get("teamId") or not os.path.exists(key):
+            return None
+        cfg["keyPath"] = key
+        return cfg
+
+    def configured(self) -> bool:
+        return self.config() is not None
+
+    def save(self):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = PUSH_DEVICES + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.devices, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, PUSH_DEVICES)
+
+    def register(self, token, env, host, topic):
+        token = "".join(ch for ch in str(token or "") if ch in "0123456789abcdefABCDEF").lower()
+        if not token:
+            raise OpError("bad_token", "empty device token")
+        self.devices[token] = {"env": "sandbox" if env == "sandbox" else "production", "host": host or "",
+                               "topic": topic or "com.kadaliao.steer", "updatedAt": now_ms()}
+        self.save()
+
+    async def bearer(self, cfg):
+        made, key_id, token = self.jwt
+        if token and key_id == cfg["keyId"] and time.time() - made < 40 * 60:
+            return token
+        head = b64url(json.dumps({"alg": "ES256", "kid": cfg["keyId"]}).encode())
+        body = b64url(json.dumps({"iss": cfg["teamId"], "iat": int(time.time())}).encode())
+        proc = await asyncio.create_subprocess_exec(
+            find_bin("openssl") or "openssl", "dgst", "-sha256", "-sign", cfg["keyPath"],
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        der, _ = await asyncio.wait_for(proc.communicate(("%s.%s" % (head, body)).encode()), 15)
+        token = "%s.%s.%s" % (head, body, b64url(der_ecdsa_to_raw(der)))
+        self.jwt = (time.time(), cfg["keyId"], token)
+        return token
+
+    async def send(self, title, body, sid=None):
+        """One alert to every registered phone. Returns (sent, errors)."""
+        cfg = self.config()
+        if not cfg or not self.devices:
+            return 0, []
+        try:
+            bearer = await self.bearer(cfg)
+        except Exception as e:
+            log("push: signing failed", repr(e))
+            return 0, ["signing failed"]
+        sent, errors = 0, []
+        for token, dev in list(self.devices.items()):
+            payload = {"aps": {"alert": {"title": title, "body": body}, "sound": "default"}, "host": dev.get("host")}
+            headers = ["-H", "authorization: bearer " + bearer, "-H", "apns-topic: " + dev.get("topic", "com.kadaliao.steer"),
+                       "-H", "apns-push-type: alert"]
+            if sid:
+                payload["aps"]["thread-id"] = sid
+                payload["sid"] = sid
+                headers += ["-H", "apns-collapse-id: " + sid[:64]]
+            server = "api.sandbox.push.apple.com" if dev.get("env") == "sandbox" else "api.push.apple.com"
+            args = [find_bin("curl") or "curl", "-sS", "--http2", "-o", "-", "-w", "\n%{http_code}"] + headers + \
+                ["--data-binary", "@-", "https://%s/3/device/%s" % (server, token)]
+            proc = await asyncio.create_subprocess_exec(*args, stdin=asyncio.subprocess.PIPE,
+                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(json.dumps(payload, ensure_ascii=False).encode()), 20)
+            except asyncio.TimeoutError:
+                proc.kill()
+                errors.append("timeout")
+                continue
+            reply, _, code = out.decode("utf-8", "replace").strip().rpartition("\n")
+            if code == "200":
+                sent += 1
+                continue
+            reason = ""
+            try:
+                reason = json.loads(reply).get("reason", "")
+            except ValueError:
+                reason = reply or err.decode("utf-8", "replace").strip()[:120]
+            errors.append(reason or code)
+            log("push failed", code, reason)
+            if code == "410" or reason in ("BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic"):
+                self.devices.pop(token, None)
+                self.save()
+        return sent, errors
+
+
 class Client:
     def __init__(self, writer):
         self.writer = writer
@@ -2494,6 +2654,7 @@ class Hub:
         self.probe_locks = {}
         self._claude_help = (0, "")
         self.caffeinate = None
+        self.pusher = Pusher()
         self.agent_versions = {}
         self.stopping = asyncio.Event()
 
@@ -2685,7 +2846,22 @@ class Hub:
             "python": sys.version.split()[0],
             "launchd": os.environ.get("STEER_LAUNCHED_BY", ""),
             "agents": await self.agents(),
+            "push": self.pusher.configured(),
         }
+
+    async def op_push_register(self, client, req):
+        self.pusher.register(req.get("token"), req.get("env"), req.get("host"), req.get("topic"))
+        return {"configured": self.pusher.configured()}
+
+    async def op_push_test(self, client, req):
+        if not self.pusher.configured():
+            raise OpError("push_not_configured", "这台电脑还没有 APNs 密钥")
+        sent, errors = await self.pusher.send("Steer", "测试通知：%s 能给你推送了" % socket.gethostname())
+        return {"sent": sent, "errors": errors}
+
+    def notify(self, title, body, sid):
+        if self.pusher.devices:
+            asyncio.ensure_future(self.pusher.send(title, body, sid))
 
     async def agents(self):
         out = {}
@@ -3234,6 +3410,28 @@ def cmd_stop(force=False):
             time.sleep(0.1)
 
 
+def cmd_push_key(args):
+    """steerd.py push-key AuthKey_XXXX.p8 KEY_ID TEAM_ID: install the APNs key."""
+    if len(args) != 3:
+        print("usage: steerd.py push-key AuthKey_<id>.p8 <key id> <team id>")
+        sys.exit(2)
+    path, key_id, team_id = args
+    with open(path, "rb") as f:
+        key = f.read()
+    if b"PRIVATE KEY" not in key:
+        print("not a .p8 private key")
+        sys.exit(1)
+    os.makedirs(APNS_DIR, mode=0o700, exist_ok=True)
+    os.chmod(APNS_DIR, 0o700)
+    target = os.path.join(APNS_DIR, "AuthKey_%s.p8" % key_id)
+    with open(target, "wb") as f:
+        f.write(key)
+    os.chmod(target, 0o600)
+    with open(os.path.join(APNS_DIR, "apns.json"), "w") as f:
+        json.dump({"keyId": key_id, "teamId": team_id}, f)
+    print("APNs key installed:", key_id, "team", team_id)
+
+
 def cmd_doctor():
     print("version", VERSION)
     print("python", sys.executable, sys.version.split()[0])
@@ -3257,6 +3455,8 @@ def main(argv):
         print(VERSION)
     elif cmd == "doctor":
         cmd_doctor()
+    elif cmd == "push-key":
+        cmd_push_key(argv[2:])
     else:
         print(__doc__)
         sys.exit(2)

@@ -16,7 +16,9 @@ process elsewhere) and relays stdin/stdout to its Unix socket
 
 | op | params | result |
 | --- | --- | --- |
-| `hello` | `app` | `helper`, `proto`, `home`, `host`, `platform`, `python`, `launchd`, `agents{claude,codex: {path, version} \| null}` |
+| `hello` | `app` | `helper`, `proto`, `home`, `host`, `platform`, `python`, `launchd`, `agents{claude,codex: {path, version} \| null}`, `push` (has an APNs key) |
+| `push.register` | `token` (hex), `env` (`sandbox`/`production`), `host` (the app's id for this host), `topic` (bundle id) | `configured` |
+| `push.test` | — | `sent`, `errors[]` |
 | `watch` | — | like `sessions.list`, and from now on `session` events for every session |
 | `sessions.list` | — | `sessions[]`: Steer sessions plus desktop Claude / Codex history (last 30 days) |
 | `session.open` | `sid`, `agent`, `cwd`, `title` (for desktop sessions) | snapshot: `session`, `items[]` (last 400), `earlier`, `requests[]`; then live events for it |
@@ -97,6 +99,21 @@ time:
   pane, if that pane is still at its shell prompt.
 - `session.interrupt` on a session a herdr/tmux pane is running sends Escape
   there.
+
+## Notifications
+
+The helper pushes straight to APNs (no relay): an ES256 token signed with
+the team's APNs key by the system `openssl`, sent with `curl --http2`. Only
+turns started from the phone (`session.send` / `session.create`) notify:
+when they need an answer (`等你批准：…`, `等你回答：…`, `等你批准计划`), and
+when they end (`做完了：<last reply>`, or `出错了：…`; interrupted turns stay
+quiet). Payload: `aps.alert{title: "<project> · <title>", body}`, `aps.thread-id`
+and `sid`, `host` (as registered) so a tap opens the session;
+`apns-collapse-id` is the session id. Tokens Apple rejects as gone are
+dropped. The key is installed per host with
+`python3 ~/.local/share/steer/steerd.py push-key AuthKey_<id>.p8 <key id> <team id>`
+(→ `~/.local/share/steer/apns/`, mode 600); registered devices live in
+`push-devices.json`.
 
 ## Housekeeping
 
