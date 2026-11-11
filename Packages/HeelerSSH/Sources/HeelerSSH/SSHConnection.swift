@@ -1,0 +1,625 @@
+import Foundation
+
+enum SSHConnectionTeardownStep: Sendable, Equatable {
+    case targetSession
+    case forwardingChannel
+    case jumpSession
+}
+
+/// Its `deinit`, like those of `SSHPTYChannel`, `SSHStreamLocalChannel`,
+/// `SSHSFTPClient` and `SSHSFTPFile`, hands remote cleanup to an unstructured
+/// `Task` that nothing retains: `deinit` returns with that work still
+/// outstanding, and no caller can await it. In a test process that reads as
+/// flakiness rather than as failure, because the work begins whenever the last
+/// reference happens to drop — so its cost can land on a later test than the
+/// one whose assertions provoked it.
+///
+/// The cost is uneven across the five, and this `deinit` is the cheap end. It
+/// invalidates the driver — no operation mutex, no deadline — and only for a
+/// connection opened through a Jump Host does it also abort the forwarding
+/// transport and close the parent, so a direct connection reaches no close at
+/// all. The one close it can reach, `SessionDriver.close`, is cancellable, and
+/// its two-second budget bounds only the native calls: the deadline is computed
+/// after `acquireOperation()` returns, so the wait for the driver's operation
+/// mutex ahead of it is unbounded. The four channel `deinit`s are the expensive
+/// end — they take that same mutex and then run non-cancellably.
+///
+/// #139 is linked for its timing evidence, not as a cause — nothing here
+/// establishes that these `deinit`s produce it; it records the same failure
+/// moving between two adjacent tests of one suite, which is timing no single
+/// test controls, and its own `deinit` hypothesis was built on
+/// `SSHPTYChannel`. #136 has since stopped the four `close*` channel teardowns
+/// invalidating the session when a close only ran out of time, but that
+/// verdict reaches no further: `SessionDriver.close`, the close reached from
+/// here, still invalidates on any failure including a bare expiry, as do the
+/// two-second cleanup in `execute`'s catch and its sibling operation paths, of
+/// which #149 tracks only some.
+public final class SSHConnection: Sendable {
+    public let hostKey: SSHHostKey
+    /// The server's SSH identification string, such as
+    /// `SSH-2.0-OpenSSH_9.9`, without the trailing CR LF. Nil only if libssh2
+    /// did not retain one.
+    public let serverIdentification: String?
+
+    private let driver: SessionDriver
+    private let parent: SSHConnection?
+    private let byteTransport: (any SSHByteTransport)?
+    private let teardownObserver: (@Sendable (SSHConnectionTeardownStep) -> Void)?
+
+    private init(
+        driver: SessionDriver,
+        hostKey: SSHHostKey,
+        serverIdentification: String?,
+        parent: SSHConnection? = nil,
+        byteTransport: (any SSHByteTransport)? = nil,
+        teardownObserver: (@Sendable (SSHConnectionTeardownStep) -> Void)? = nil
+    ) {
+        self.driver = driver
+        self.hostKey = hostKey
+        self.serverIdentification = serverIdentification
+        self.parent = parent
+        self.byteTransport = byteTransport
+        self.teardownObserver = teardownObserver
+    }
+
+    /// Attempts one handshake makes before a key-exchange failure is reported.
+    /// See `SessionDriver.handshakeFailedInKeyExchange` for why the second
+    /// attempt is independent of the first rather than a repeat of it (#332).
+    /// Every attempt shares the caller's deadline, so a redial cannot extend
+    /// the timeout the caller asked for.
+    static let handshakeAttemptLimit = 2
+
+    public static func connect(
+        to endpoint: SSHEndpoint,
+        timeout: Duration
+    ) async throws -> SSHConnection {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        var attemptsLeft = handshakeAttemptLimit
+        while true {
+            attemptsLeft -= 1
+            let driver = SessionDriver()
+            do {
+                let hostKey = try await driver.handshake(
+                    endpoint: endpoint,
+                    timeout: ContinuousClock.now.duration(to: deadline))
+                return SSHConnection(
+                    driver: driver,
+                    hostKey: hostKey,
+                    serverIdentification: await driver.serverIdentification)
+            } catch {
+                let retryable = await driver.handshakeFailedInKeyExchange
+                let sinkDuration = await driver.handshakeFailureDiagnosticDuration
+                guard
+                    attemptsLeft > 0,
+                    retryable,
+                    ContinuousClock.now < deadline
+                else {
+                    if retryable {
+                        noteHandshakeAttempt(
+                            endpoint: endpoint,
+                            via: nil,
+                            attempt: handshakeAttemptLimit - attemptsLeft,
+                            sinkDuration: sinkDuration,
+                            cleanupDuration: .zero,
+                            remaining: ContinuousClock.now.duration(to: deadline),
+                            canRedial: false)
+                    }
+                    throw error
+                }
+                noteHandshakeAttempt(
+                    endpoint: endpoint,
+                    via: nil,
+                    attempt: handshakeAttemptLimit - attemptsLeft,
+                    sinkDuration: sinkDuration,
+                    cleanupDuration: .zero,
+                    remaining: ContinuousClock.now.duration(to: deadline),
+                    canRedial: true)
+            }
+        }
+    }
+
+    /// Opens an SSH connection over a byte stream something outside this
+    /// package dials, such as an in-process overlay network node. `endpoint`
+    /// only names the target for diagnostics; `openStream` decides where the
+    /// bytes go. Each attempt asks for a fresh stream with the time it has
+    /// left, so a key-exchange redial never reuses a stream the failed
+    /// handshake already wrote to. The returned connection releases the
+    /// stream after its session on close.
+    public static func connect(
+        to endpoint: SSHEndpoint,
+        timeout: Duration,
+        transportLabel: String,
+        openStream: @escaping @Sendable (Duration) async throws -> SSHExternalStream
+    ) async throws -> SSHConnection {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        var attemptsLeft = handshakeAttemptLimit
+        while true {
+            attemptsLeft -= 1
+            let stream = try await openStream(ContinuousClock.now.duration(to: deadline))
+            let driver = SessionDriver()
+            do {
+                let hostKey = try await driver.handshake(
+                    transport: stream,
+                    endpoint: endpoint,
+                    timeout: ContinuousClock.now.duration(to: deadline),
+                    transportLabel: transportLabel)
+                return SSHConnection(
+                    driver: driver,
+                    hostKey: hostKey,
+                    serverIdentification: await driver.serverIdentification,
+                    byteTransport: stream)
+            } catch {
+                let retryable = await driver.handshakeFailedInKeyExchange
+                let sinkDuration = await driver.handshakeFailureDiagnosticDuration
+                let cleanupStarted = ContinuousClock.now
+                await driver.invalidate()
+                stream.abort()
+                let cleanupDuration = cleanupStarted.duration(to: ContinuousClock.now)
+                let canRedial = attemptsLeft > 0 && retryable && ContinuousClock.now < deadline
+                if retryable {
+                    noteHandshakeAttempt(
+                        endpoint: endpoint,
+                        via: transportLabel,
+                        attempt: handshakeAttemptLimit - attemptsLeft,
+                        sinkDuration: sinkDuration,
+                        cleanupDuration: cleanupDuration,
+                        remaining: ContinuousClock.now.duration(to: deadline),
+                        canRedial: canRedial)
+                }
+                guard canRedial else { throw error }
+            }
+        }
+    }
+
+    /// Opens an SSH connection to `endpoint` through this authenticated Jump
+    /// Host. The returned connection owns both hops and closes them in target,
+    /// forwarding-channel, Jump Host order.
+    public func connectThrough(
+        to endpoint: SSHEndpoint,
+        timeout: Duration
+    ) async throws -> SSHConnection {
+        try await connectThrough(
+            to: endpoint,
+            timeout: timeout,
+            teardownObserver: nil)
+    }
+
+    func connectThrough(
+        to endpoint: SSHEndpoint,
+        timeout: Duration,
+        teardownObserver: (@Sendable (SSHConnectionTeardownStep) -> Void)?
+    ) async throws -> SSHConnection {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        var attemptsLeft = Self.handshakeAttemptLimit
+        while true {
+            attemptsLeft -= 1
+            let remaining = ContinuousClock.now.duration(to: deadline)
+            let transport = try await driver.openDirectTCPIP(
+                endpoint: endpoint,
+                timeout: remaining)
+            let targetDriver = SessionDriver()
+            do {
+                let hostKey = try await targetDriver.handshake(
+                    transport: transport,
+                    endpoint: endpoint,
+                    timeout: remaining)
+                return SSHConnection(
+                    driver: targetDriver,
+                    hostKey: hostKey,
+                    serverIdentification: await targetDriver.serverIdentification,
+                    parent: self,
+                    byteTransport: transport,
+                    teardownObserver: teardownObserver)
+            } catch {
+                // Read before invalidating: only the target hop is retryable,
+                // and only the forwarding channel it rode on is discarded. The
+                // Jump Host session stays open for the redial and is closed
+                // below once no attempt is left.
+                let retryable = await targetDriver.handshakeFailedInKeyExchange
+                let sinkDuration = await targetDriver.handshakeFailureDiagnosticDuration
+                let cleanupStarted = ContinuousClock.now
+                await targetDriver.invalidate()
+                transport.abort()
+                try? await transport.close(timeout: .seconds(2))
+                let cleanupDuration = cleanupStarted.duration(to: ContinuousClock.now)
+                guard attemptsLeft > 0, retryable, ContinuousClock.now < deadline else {
+                    let remaining = ContinuousClock.now.duration(to: deadline)
+                    try? await close(timeout: .seconds(2))
+                    if retryable {
+                        Self.noteHandshakeAttempt(
+                            endpoint: endpoint,
+                            via: "the Jump Host transport",
+                            attempt: Self.handshakeAttemptLimit - attemptsLeft,
+                            sinkDuration: sinkDuration,
+                            cleanupDuration: cleanupDuration,
+                            remaining: remaining,
+                            canRedial: false)
+                    }
+                    throw error
+                }
+                Self.noteHandshakeAttempt(
+                    endpoint: endpoint,
+                    via: "the Jump Host transport",
+                    attempt: Self.handshakeAttemptLimit - attemptsLeft,
+                    sinkDuration: sinkDuration,
+                    cleanupDuration: cleanupDuration,
+                    remaining: ContinuousClock.now.duration(to: deadline),
+                    canRedial: true)
+            }
+        }
+    }
+
+    private static func noteHandshakeAttempt(
+        endpoint: SSHEndpoint,
+        via: String?,
+        attempt: Int,
+        sinkDuration: Duration?,
+        cleanupDuration: Duration,
+        remaining: Duration,
+        canRedial: Bool
+    ) {
+        SSHDiagnostics.note(
+            "handshake with \(endpoint.host):\(endpoint.port)"
+                + (via.map { " over \($0)" } ?? "")
+                + " [attempt=\(attempt)/\(handshakeAttemptLimit); "
+                + "sink_elapsed=\(sinkDuration.map { String(describing: $0) } ?? "unmeasured"); "
+                + "forwarding_cleanup=\(cleanupDuration); remaining_budget=\(remaining); "
+                + "can_redial=\(canRedial)] failed in key exchange, "
+                + (canRedial ? "redialling" : "no redial"))
+    }
+
+    public func authenticate(
+        username: String,
+        password: String,
+        timeout: Duration
+    ) async throws {
+        try await driver.authenticate(
+            username: username,
+            password: password,
+            timeout: timeout)
+    }
+
+    public func authenticate(
+        username: String,
+        publicKey: Data,
+        signer: @escaping SSHSigningClosure,
+        timeout: Duration
+    ) async throws {
+        try await driver.authenticate(
+            username: username,
+            publicKey: publicKey,
+            signer: signer,
+            timeout: timeout)
+    }
+
+    public func execute(
+        _ command: String,
+        input: Data = Data(),
+        timeout: Duration
+    ) async throws -> SSHExecResult {
+        try await driver.execute(command: command, input: input, timeout: timeout)
+    }
+
+    /// Opens one SSH session channel, sends exactly one newline-terminated
+    /// input line, reads one bounded newline-terminated stdout response, and
+    /// closes the channel. This is for forced-command request/response
+    /// protocols whose process lifetime must not control the caller's bound.
+    public func executeResponseLine(
+        _ command: String,
+        input: Data,
+        maximumResponseBytes: Int,
+        timeout: Duration
+    ) async throws -> Data {
+        try await driver.executeResponseLine(
+            command: command,
+            input: input,
+            maximumResponseBytes: maximumResponseBytes,
+            timeout: timeout)
+    }
+
+    /// Opens one SSH session channel, requests the configured PTY, and then
+    /// executes `command` directly. No login shell or shell request is exposed
+    /// to the caller's terminal stream.
+    public func openPTY(
+        command: String,
+        terminal: String = "xterm-256color",
+        columns: Int,
+        rows: Int,
+        timeout: Duration
+    ) async throws -> SSHPTYChannel {
+        try await driver.openPTY(
+            command: command,
+            terminal: terminal,
+            columns: columns,
+            rows: rows,
+            timeout: timeout)
+    }
+
+    /// Opens one long-lived SSH exec channel without allocating a PTY.
+    /// Standard output remains byte-preserving and separate from diagnostics;
+    /// standard error is discarded so it cannot fill the channel's receive
+    /// window while the caller reads a stdout protocol.
+    public func openExec(
+        command: String,
+        timeout: Duration
+    ) async throws -> SSHExecChannel {
+        try await driver.openExec(command: command, timeout: timeout)
+    }
+
+    /// Opens one direct-streamlocal channel, writes one request, reads one
+    /// newline-terminated response, and closes the channel. Every call owns a
+    /// fresh channel to preserve one-request-per-socket protocols.
+    /// `beforeRequestWrite` may throw after the channel opens but before any
+    /// byte is written; its original error is preserved after channel cleanup.
+    /// `onRequestWritten` runs exactly once after the complete request.
+    public func exchangeStreamLocal(
+        socketPath: String,
+        request: Data,
+        maximumResponseBytes: Int = 1_048_576,
+        timeout: Duration,
+        beforeRequestWrite: (@Sendable () async throws -> Void)? = nil,
+        onRequestWritten: (@Sendable () async -> Void)? = nil
+    ) async throws -> Data {
+        try await driver.exchangeStreamLocal(
+            socketPath: socketPath,
+            request: request,
+            maximumResponseBytes: maximumResponseBytes,
+            timeout: timeout,
+            beforeRequestWrite: beforeRequestWrite,
+            onRequestWritten: onRequestWritten)
+    }
+
+    /// Opens one long-lived direct-streamlocal channel. The returned handle
+    /// owns only that channel; closing it leaves this SSH connection reusable
+    /// when native teardown succeeds.
+    public func openStreamLocal(
+        socketPath: String,
+        timeout: Duration
+    ) async throws -> SSHStreamLocalChannel {
+        try await driver.openStreamLocal(
+            socketPath: socketPath,
+            timeout: timeout)
+    }
+
+    /// Opens the package's deliberately small SFTP surface on one SSH session
+    /// channel. Closing the returned client leaves this connection reusable.
+    public func openSFTP(timeout: Duration) async throws -> SSHSFTPClient {
+        try await driver.openSFTP(timeout: timeout)
+    }
+
+    /// Whether this session still has a live native connection that can
+    /// safely admit another operation. An uncertain channel outcome makes
+    /// this false before the app can reuse the connection.
+    public var isConnected: Bool {
+        get async { await driver.isReusable }
+    }
+
+#if DEBUG
+    /// A connection that never shook hands, carrying the identification a real
+    /// server would have sent. It is for what the app decides from that string
+    /// alone: `isConnected` is false and nothing can reach a server through it.
+    public static func neverConnectedForTesting(serverIdentification: String) -> SSHConnection {
+        SSHConnection(
+            driver: SessionDriver(),
+            hostKey: SSHHostKey(algorithm: "none", key: Data()),
+            serverIdentification: serverIdentification)
+    }
+
+    public func delayNextSFTPWriteForTesting(_ delay: Duration) async {
+        await driver.delayNextSFTPWriteForTesting(delay)
+    }
+
+    public var isSFTPWriteDelayedForTesting: Bool {
+        get async { await driver.isSFTPWriteDelayedForTesting }
+    }
+
+    public func holdNextSessionWaitForTesting(
+        _ hold: @escaping @Sendable () async throws -> Void
+    ) async {
+        await driver.holdNextSessionWaitForTesting(hold)
+    }
+
+    func holdOperationForTesting(_ hold: @Sendable () async -> Void) async {
+        await driver.holdOperationForTesting(hold)
+    }
+
+    func waitForInboundBeforeNextExchangeStderrReadForTesting() async {
+        await driver.waitForInboundBeforeNextExchangeStderrReadForTesting()
+    }
+
+    func exchangeStderrReadTookReplyForTesting() async -> Bool {
+        await driver.exchangeStderrReadTookReplyForTesting()
+    }
+
+    func waitForInboundBeforeNextExecStdoutReadForTesting() async {
+        await driver.waitForInboundBeforeNextExecStdoutReadForTesting()
+    }
+
+    func execStdoutReadTookReplyForTesting() async -> Bool {
+        await driver.execStdoutReadTookReplyForTesting()
+    }
+
+    func failNextExecStderrReadForTesting(_ error: SSHError) async {
+        await driver.failNextExecStderrReadForTesting(error)
+    }
+
+    func interruptNextExecStdoutOwnerForTesting(_ error: SSHError) async {
+        await driver.interruptNextExecStdoutOwnerForTesting(error)
+    }
+
+    func forceNextExchangeReadOwnerForTesting(
+        stderr: Bool,
+        holdingOwnedRead hold: (@Sendable () async -> Void)? = nil
+    ) async {
+        await driver.forceNextExchangeReadOwnerForTesting(stderr: stderr, holdingOwnedRead: hold)
+    }
+
+    public func runNextStreamLocalTimeoutHookForTesting(
+        _ hook: @escaping @Sendable () async throws -> Void
+    ) async {
+        await driver.runNextStreamLocalTimeoutHookForTesting(hook)
+    }
+
+    public func holdNextExecChannelAllocationForTesting(
+        _ hold: @escaping @Sendable () async throws -> Void
+    ) async {
+        await driver.holdNextExecChannelAllocationForTesting(hold)
+    }
+
+    public func holdNextExecCleanupForTesting(
+        _ hold: @escaping @Sendable () async throws -> Void
+    ) async {
+        await driver.holdNextExecCleanupForTesting(hold)
+    }
+
+    public func runNextCompensationUnlinkPhaseHookForTesting(
+        _ hook: @escaping @Sendable () async throws -> Void
+    ) async {
+        await driver.runNextCompensationUnlinkPhaseHookForTesting(hook)
+    }
+
+    public func runNextCompensationStatPhaseHookForTesting(
+        _ hook: @escaping @Sendable () async throws -> Void
+    ) async {
+        await driver.runNextCompensationStatPhaseHookForTesting(hook)
+    }
+
+    public func runNextCompensationShutdownHookForTesting(
+        _ hook: @escaping @Sendable () async throws -> Void
+    ) async {
+        await driver.runNextCompensationShutdownHookForTesting(hook)
+    }
+
+    public func failNextSFTPInitBeforeEAGAINForTesting() async {
+        await driver.failNextSFTPInitBeforeEAGAINForTesting()
+    }
+
+    public func holdNextOutboundWriteParkForTesting(
+        _ hold: @escaping @Sendable () async -> Void
+    ) async {
+        await driver.holdNextOutboundWriteParkForTesting(hold)
+    }
+
+    public func holdNextOneShotEstablishedForTesting(
+        _ hold: @escaping @Sendable () async throws -> Void
+    ) async {
+        await driver.holdNextOneShotEstablishedForTesting(hold)
+    }
+
+    public func holdNextOwnedLoopTopForTesting(
+        _ hold: @escaping @Sendable () async throws -> Void
+    ) async {
+        await driver.holdNextOwnedLoopTopForTesting(hold)
+    }
+
+    public func holdNextOwnedDrainForTesting(
+        _ hold: @escaping @Sendable () async throws -> Void
+    ) async {
+        await driver.holdNextOwnedDrainForTesting(hold)
+    }
+
+    public func holdNextChannelOpenSlotForTesting(
+        _ hold: @escaping @Sendable () async throws -> Void
+    ) async {
+        await driver.holdNextChannelOpenSlotForTesting(hold)
+    }
+
+    func holdNextChannelTeardownForTesting(
+        _ hold: @escaping @Sendable () async -> Void
+    ) async {
+        await driver.holdNextChannelTeardownForTesting(hold)
+    }
+
+    func failNextResumedChannelOpenWaiterForTesting(_ error: SSHError) async {
+        await driver.failNextResumedChannelOpenWaiterForTesting(error)
+    }
+
+    func holdNextChannelOpenWaiterRegistrationForTesting(
+        _ hold: @escaping @Sendable () async -> Void
+    ) async {
+        await driver.holdNextChannelOpenWaiterRegistrationForTesting(hold)
+    }
+
+    public func sftpUseCountForTesting() async -> Int {
+        await driver.sftpUseCountForTesting()
+    }
+
+    public func sftpIdleWaiterCountForTesting() async -> Int {
+        await driver.sftpIdleWaiterCountForTesting()
+    }
+
+    public func channelOpenWaiterCountForTesting() async -> Int {
+        await driver.channelOpenWaiterCountForTesting()
+    }
+
+    func ptyTeardownWaiterCountForTesting() async -> Int {
+        await driver.ptyTeardownWaiterCountForTesting()
+    }
+
+    func ptyChannelCountForTesting() async -> Int {
+        await driver.ptyChannelCountForTesting()
+    }
+
+    public func startSamplingTransportSendOwnerForTesting() async {
+        await driver.startSamplingTransportSendOwnerForTesting()
+    }
+
+    func transportSendOwnerSamplesForTesting() async -> [TransportSendOwnerSample] {
+        await driver.transportSendOwnerSamplesForTesting()
+    }
+
+    public func oneShotRegistryCountForTesting() async -> Int {
+        await driver.oneShotRegistryCountForTesting()
+    }
+
+    public func shrinkSendBufferForTesting(bytes: Int) async throws {
+        try await driver.shrinkSendBufferForTesting(bytes: bytes)
+    }
+
+    func resourceStateForTesting() async -> SessionDriverResourceState {
+        await driver.resourceStateForTesting()
+    }
+
+    public var operationWaiterCountForTesting: Int {
+        get async { await driver.operationWaiterCountForTesting }
+    }
+#endif
+
+    public func close(timeout: Duration) async throws {
+        var firstError: (any Error)?
+        do {
+            try await driver.close(timeout: timeout)
+        } catch {
+            firstError = error
+        }
+        if byteTransport != nil { teardownObserver?(.targetSession) }
+        if let byteTransport {
+            do {
+                try await byteTransport.close(timeout: timeout)
+            } catch {
+                if firstError == nil { firstError = error }
+            }
+            teardownObserver?(.forwardingChannel)
+        }
+        if let parent {
+            do {
+                try await parent.close(timeout: timeout)
+            } catch {
+                if firstError == nil { firstError = error }
+            }
+            teardownObserver?(.jumpSession)
+        }
+        if let firstError { throw firstError }
+    }
+
+    deinit {
+        let driver = driver
+        let byteTransport = byteTransport
+        let parent = parent
+        Task {
+            await driver.invalidate()
+            byteTransport?.abort()
+            if let parent { try? await parent.close(timeout: .seconds(2)) }
+        }
+    }
+}

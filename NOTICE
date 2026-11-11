@@ -1,0 +1,9 @@
+Steer
+Copyright 2026 Kada Liao
+
+This product includes software from Heeler (https://github.com/ZingerLittleBee/Heeler),
+licensed under the Apache License, Version 2.0:
+
+  - Packages/HeelerSSH (the SSH package, with its bundled libssh2 and OpenSSL builds;
+    their own licenses are in Packages/HeelerSSH/Artifacts/Notices)
+  - App/Support/Keys.swift (adapted: device key, Keychain storage, host key fingerprints)

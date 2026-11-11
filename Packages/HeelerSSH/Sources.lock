@@ -1,0 +1,12 @@
+# Audited upstream sources for the checked-in native artifacts.
+LIBSSH2_VERSION="c7557852f1b7c0d3b9cffd5390eb33fdf93fb17f"
+LIBSSH2_TAG="master-c755785"
+LIBSSH2_COMMIT="c7557852f1b7c0d3b9cffd5390eb33fdf93fb17f"
+LIBSSH2_URL="https://github.com/libssh2/libssh2/archive/c7557852f1b7c0d3b9cffd5390eb33fdf93fb17f.tar.gz"
+LIBSSH2_SHA256="196c135a399fa16beb245ac6bd6e6448419decc1499ab95deac5681300487b8d"
+
+OPENSSL_VERSION="3.6.3"
+OPENSSL_TAG="openssl-3.6.3"
+OPENSSL_COMMIT="aae016bfd52fcad2bc9657c2c782cfdf73b1ed5f"
+OPENSSL_URL="https://github.com/openssl/openssl/releases/download/openssl-3.6.3/openssl-3.6.3.tar.gz"
+OPENSSL_SHA256="243a86649cf6f23eeb6a2ff2456e09e5d77dd9018a54d3d96b0c6bdd6ba6c7f1"
