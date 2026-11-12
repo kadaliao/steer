@@ -28,6 +28,9 @@ struct SessionSummary: Codable, Sendable, Identifiable, Equatable, Hashable {
     /// After Steer took the session over from a herdr/tmux pane, it reopens
     /// it there once the phone is done (`herdr` / `tmux`).
     var handback: String?
+    /// How many `steer` terminals on the host have this session open. They
+    /// share the helper's process with the phone, so both sides stay in sync.
+    var terminals: Int?
 
     var id: String { sid }
 
@@ -92,6 +95,8 @@ struct TimelineItem: Codable, Sendable, Identifiable, Equatable {
     var costUsd: Double?
     var ts: Double?
     var endTs: Double?
+    /// User items: `phone` or `terminal` (a `steer` terminal on the host).
+    var origin: String?
 
     var isRunning: Bool { status == "running" }
 }

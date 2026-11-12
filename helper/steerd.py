@@ -14,11 +14,15 @@ Commands:
   stop      ask a running daemon to exit
   version   print the helper version
   doctor    print what the helper can see (agents, daemon, paths)
+  claude    a terminal chat on the same Claude session the phone sees
+            (-c: this folder's latest, -r [ID]: pick one)
+  install-cli [dir]  put a `steer` command for `claude` on PATH
 """
 from __future__ import annotations
 
 import asyncio
 import base64
+import codecs
 import difflib
 import glob
 import json
@@ -33,9 +37,10 @@ import struct
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 
-VERSION = "0.4.2"
+VERSION = "0.5.0"
 PROTO = 1
 
 HOME = os.path.expanduser("~")
@@ -114,7 +119,12 @@ def rel_path(path: str, cwd: str) -> str:
     try:
         if cwd and (path == cwd or path.startswith(cwd.rstrip("/") + "/")):
             return os.path.relpath(path, cwd)
-    except ValueError:
+        if cwd and path.startswith("/"):
+            # /tmp/x and /private/tmp/x are the same folder on macOS.
+            real, real_cwd = os.path.realpath(path), os.path.realpath(cwd)
+            if real == real_cwd or real.startswith(real_cwd.rstrip("/") + "/"):
+                return os.path.relpath(real, real_cwd)
+    except (ValueError, OSError):
         pass
     if path.startswith(HOME + "/"):
         return "~/" + path[len(HOME) + 1:]
@@ -315,6 +325,14 @@ class ClaudeTranscript:
                 add_assistant_block(self, msg_id, block, self.cwd, ts, final=True)
         elif t == "system" and m.get("subtype") == "compact_boundary":
             self.put({"id": m.get("uuid") or new_id("n"), "kind": "notice", "code": "compacted", "text": "", "ts": ts})
+        elif t == "attachment":
+            # A message sent while a turn ran, taken into that turn.
+            a = m.get("attachment") or {}
+            if a.get("type") == "queued_command" and a.get("commandMode", "prompt") == "prompt":
+                text = clean_user_text(text_of(a.get("prompt")))
+                if not is_noise_user_text(text):
+                    self.put({"id": a.get("source_uuid") or m.get("uuid") or new_id("u"), "kind": "user",
+                              "text": text, "images": 0, "ts": ts})
 
 
 def parse_ts(value):
@@ -960,6 +978,7 @@ class Session:
             "live": self.is_live(),
             "error": self.error,
             "suggestion": self.suggestion if state == "idle" else None,
+            "terminals": self.hub.terminal_viewers(self.sid),
         }
 
     def is_live(self) -> bool:
@@ -1082,7 +1101,7 @@ class Session:
         self.loaded = True
 
     # actions (overridden) ---------------------------------------------
-    async def send(self, text, images):
+    async def send(self, text, images, origin="phone"):
         raise OpError("unsupported")
 
     async def interrupt(self):
@@ -1134,6 +1153,7 @@ class ClaudeSession(Session):
         self.terminal = None        # registry entry while a terminal has it open
         self.takeover_task = None
         self.takeover_queue = []    # (item, content) waiting for the terminal to let go
+        self.replays = False        # Claude echoes each stdin message as it takes it (--replay-user-messages)
         self.handback = None        # {"term", "argv"}: reopen it there once the phone is done
         self.handback_task = None
 
@@ -1309,6 +1329,12 @@ class ClaudeSession(Session):
         if not handback or self.state != "idle" or self.pending or self.queued or self.takeover_task:
             return
         term = handback["term"]
+        if self.hub.terminal_viewers(self.sid):
+            # Someone follows it in `steerd.py claude` now; reopening it in the pane would split it.
+            log("claude handback skipped: a Steer terminal has it open", self.sid)
+            self.handback = None
+            self.touch(urgent=True)
+            return
         if not await terminal_at_shell(term):
             log("claude handback skipped: the pane is gone or busy", self.sid)
             self.handback = None
@@ -1352,6 +1378,9 @@ class ClaudeSession(Session):
         if self.meta.get("mode"):
             args += ["--permission-mode", self.meta["mode"]]
         init = {"subtype": "initialize"}
+        self.replays = await self.hub.claude_supports("--replay-user-messages")
+        if self.replays:
+            args.append("--replay-user-messages")
         if await self.hub.claude_supports("--prompt-suggestions"):
             args += ["--prompt-suggestions", "true"]
             init["promptSuggestions"] = True
@@ -1507,6 +1536,9 @@ class ClaudeSession(Session):
         if t == "user":
             msg = m.get("message") or {}
             content = msg.get("content")
+            if m.get("isReplay"):
+                self.on_replay(content)
+                return
             if isinstance(content, list):
                 result = m.get("tool_use_result", m.get("toolUseResult"))
                 for b in content:
@@ -1522,6 +1554,22 @@ class ClaudeSession(Session):
                 self.suggestion = head(text, 300)
                 self.hub.session_changed(self, urgent=True)
             return
+
+    def on_replay(self, content):
+        """Claude took one of our messages. A queued one may be taken in the
+        middle of the running turn (it answers both in one go), so this, not
+        the end of the turn, is when it stops waiting."""
+        if isinstance(content, list):
+            text = "".join(b.get("text") or "" for b in content if isinstance(b, dict) and b.get("type") == "text")
+        else:
+            text = content or ""
+        for item_id in self.queued:
+            item = self.get(item_id)
+            if item is not None and (item.get("text") or "") == text:
+                self.queued.remove(item_id)
+                item["queued"] = False
+                self.emit_item(item)
+                return
 
     def on_stream_event(self, ev):
         et = ev.get("type")
@@ -1605,11 +1653,13 @@ class ClaudeSession(Session):
         self.clear_requests()
         self.idle_since = time.time()
         if self.queued:
-            # Claude takes the next queued message as its own turn right away.
-            item = self.get(self.queued.pop(0))
-            if item:
-                item["queued"] = False
-                self.emit_item(item)
+            # What Claude has not taken yet starts the next turn right away. With
+            # replays the echo says when; without, assume it is the next one.
+            if not self.replays:
+                item = self.get(self.queued.pop(0))
+                if item:
+                    item["queued"] = False
+                    self.emit_item(item)
             self.set_state("running")
             return
         self.skip_transcript()
@@ -1618,10 +1668,11 @@ class ClaudeSession(Session):
         self.schedule_handback()
 
     # actions ---------------------------------------------------------
-    async def send(self, text, images):
+    async def send(self, text, images, origin="phone"):
         await self.load()
         self.suggestion = None
-        self.phone_turn = True
+        if origin != "terminal":
+            self.phone_turn = True
         if self.handback_task:
             self.handback_task.cancel()
             self.handback_task = None
@@ -1633,7 +1684,8 @@ class ClaudeSession(Session):
         else:
             content = text
         if self.takeover_task or self.foreign_terminal(claude_open_sessions(max_age=0).get(self.native_id)):
-            item = {"id": new_id("u"), "kind": "user", "text": text, "images": len(images or []), "queued": True}
+            item = {"id": new_id("u"), "kind": "user", "text": text, "images": len(images or []), "queued": True,
+                    "origin": origin}
             self.put(item)
             self.takeover_queue.append((item, content))
             if not self.takeover_task:
@@ -1641,7 +1693,8 @@ class ClaudeSession(Session):
             self.mark_started(text)
             return {"id": item["id"]}
         busy = self.state == "running" or bool(self.pending)
-        item = {"id": new_id("u"), "kind": "user", "text": text, "images": len(images or []), "queued": busy}
+        item = {"id": new_id("u"), "kind": "user", "text": text, "images": len(images or []), "queued": busy,
+                "origin": origin}
         self.put(item)
         if busy:
             self.queued.append(item["id"])
@@ -2313,12 +2366,14 @@ class CodexSession(Session):
             return
         self.add_request(rid, view, m)
 
-    async def send(self, text, images):
+    async def send(self, text, images, origin="phone"):
         await self.load()
-        self.phone_turn = True
+        if origin != "terminal":
+            self.phone_turn = True
         item_id = new_id("u")
         steering = self.state == "running" and self.turn_id is not None
-        self.put({"id": item_id, "kind": "user", "text": text, "images": len(images or []), "queued": False})
+        self.put({"id": item_id, "kind": "user", "text": text, "images": len(images or []), "queued": False,
+                  "origin": origin})
         try:
             await self.ensure_thread()
             inputs = []
@@ -2675,6 +2730,7 @@ class Pusher:
 class Client:
     def __init__(self, writer):
         self.writer = writer
+        self.kind = "app"       # "terminal" for `steerd.py claude`
         self.watching = False
         self.open = set()
         self.closed = False
@@ -2835,6 +2891,18 @@ class Hub:
         return s
 
     # fan-out -----------------------------------------------------------
+    def terminal_viewers(self, sid) -> int:
+        """How many `steerd.py claude` terminals have this session open."""
+        return sum(1 for c in self.clients if c.kind == "terminal" and not c.closed and sid in c.open)
+
+    def viewers_changed(self, client, sids):
+        if client.kind != "terminal":
+            return
+        for sid in sids:
+            s = self.sessions.get(sid)
+            if s is not None:
+                self.session_changed(s, urgent=True)
+
     def to_watchers(self, sid, msg):
         for c in list(self.clients):
             if sid in c.open:
@@ -2884,6 +2952,8 @@ class Hub:
         return s
 
     async def op_hello(self, client, req):
+        if req.get("client") == "terminal":
+            client.kind = "terminal"
         return {
             "helper": VERSION,
             "proto": PROTO,
@@ -2988,10 +3058,14 @@ class Hub:
             s = self.add_session(meta)
         await s.load()
         client.open.add(sid)
+        self.viewers_changed(client, [sid])
         return s.snapshot()
 
     async def op_session_close(self, client, req):
-        client.open.discard(req.get("sid"))
+        sid = req.get("sid")
+        if sid in client.open:
+            client.open.discard(sid)
+            self.viewers_changed(client, [sid])
         return {}
 
     async def op_session_create(self, client, req):
@@ -3015,16 +3089,21 @@ class Hub:
         s.loaded = True
         client.open.add(s.sid)
         s.save()
+        self.viewers_changed(client, [s.sid])
         result = {"session": s.summary()}
         if req.get("text") or req.get("images"):
-            sent = await s.send(req.get("text") or "", req.get("images") or [])
+            sent = await s.send(req.get("text") or "", req.get("images") or [], origin=self.origin(client))
             result["sent"] = sent
             result["session"] = s.summary()
         return result
 
+    @staticmethod
+    def origin(client):
+        return "terminal" if client.kind == "terminal" else "phone"
+
     async def op_session_send(self, client, req):
         s = self.session(req.get("sid"))
-        return await s.send(req.get("text") or "", req.get("images") or [])
+        return await s.send(req.get("text") or "", req.get("images") or [], origin=self.origin(client))
 
     async def op_session_interrupt(self, client, req):
         return await self.session(req.get("sid")).interrupt()
@@ -3180,6 +3259,7 @@ class Hub:
         finally:
             client.closed = True
             self.clients.discard(client)
+            self.viewers_changed(client, list(client.open))
             try:
                 writer.close()
             except Exception:
@@ -3272,6 +3352,7 @@ async def serve_main():
     hub.load_sessions()
     server = await asyncio.start_unix_server(hub.handle_client, path=SOCK, limit=LINE_LIMIT)
     os.chmod(SOCK, 0o600)
+    own_sock = os.stat(SOCK).st_ino
     log("steerd", VERSION, "listening on", SOCK, "pid", os.getpid())
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -3288,11 +3369,14 @@ async def serve_main():
     if hub.caffeinate is not None:
         hub.caffeinate.terminate()
     server.close()
-    await hub.shutdown_all()
+    # A new daemon may bind the path while this one winds its sessions down:
+    # remove only our own socket, and right away.
     try:
-        os.remove(SOCK)
+        if os.stat(SOCK).st_ino == own_sock:
+            os.remove(SOCK)
     except OSError:
         pass
+    await hub.shutdown_all()
 
 
 # ---------------------------------------------------------------------------
@@ -3493,6 +3577,1487 @@ def cmd_doctor():
         print("launch agent", launch_agent_path(), "present" if os.path.exists(launch_agent_path()) else "absent")
 
 
+# ---------------------------------------------------------------------------
+# Terminal client: `steerd.py claude`, the live session the phone also sees
+# ---------------------------------------------------------------------------
+#
+# It speaks the app's protocol over the daemon's socket, so one Claude process
+# (the helper's) serves the phone and this terminal at once: each side sees the
+# other's messages as they stream and either can answer a request. Finished
+# output goes into the terminal's own scrollback; only the bottom (what is
+# still changing, the request being asked, the status line and the input) is
+# redrawn in place.
+
+CLI_HISTORY = os.path.join(DATA_DIR, "cli-history.json")
+TERM_SEQ = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-Z\\-_]")
+CSI_KEY = re.compile(r"\x1b[\[O][0-9;]*[~A-Za-z]")
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+BOLD, GREY, RED, GREEN, YELLOW, CYAN = "1", "90", "31", "32", "33", "36"
+MODE_ORDER = ["default", "acceptEdits", "plan", "auto", "bypassPermissions"]
+MODE_LABELS = {"default": "询问", "acceptEdits": "自动改文件", "plan": "计划", "auto": "自动",
+               "bypassPermissions": "全自动", "dontAsk": "不询问"}
+TERMINAL_PLACES = {"herdr": "herdr 窗格", "tmux": "tmux 窗格"}
+LOCAL_COMMANDS = [
+    ("help", "快捷键和命令"),
+    ("new", "开一个新会话（/clear 也行）"),
+    ("model", "看或换模型，比如 /model haiku"),
+    ("mode", "看或换权限模式，比如 /mode plan"),
+    ("status", "这个会话的 ID、文件夹、模式和模型"),
+    ("exit", "离开；会话留在小助手里，手机上能接着用"),
+]
+CLI_HELP = """Enter 发送 · Ctrl+J 或 Alt+Enter 换行（行尾打 \\ 再回车也行）
+Esc 打断正在跑的一轮 · Shift+Tab 切换权限模式 · Tab 补全 / 命令 · ↑↓ 翻历史
+Ctrl+C 清空输入，再按打断，空闲时连按两次离开 · Ctrl+D 离开 · Ctrl+L 清屏
+离开后会话还在小助手里，手机上能接着用；回来用 steer -c（这个文件夹最近的会话）或 steer -r"""
+
+
+def sgr(code, text):
+    return "\x1b[%sm%s\x1b[0m" % (code, text) if text else ""
+
+
+def plain(text) -> str:
+    """Agent or command text made safe to print: no escape sequences or control characters."""
+    text = TERM_SEQ.sub("", text or "").replace("\r\n", "\n").replace("\t", "    ")
+    return "".join(c for c in text if c == "\n" or (ord(c) >= 32 and ord(c) != 0x7f))
+
+
+def char_width(ch) -> int:
+    o = ord(ch)
+    if o < 32 or 0x7f <= o < 0xa0 or o in (0x200b, 0x200c, 0x200d, 0x2060, 0xfe0e, 0xfe0f):
+        return 0
+    if unicodedata.combining(ch):
+        return 0
+    if unicodedata.east_asian_width(ch) in ("W", "F") or 0x1f300 <= o <= 0x1faff:
+        return 2
+    return 1
+
+
+def _tokens(text):
+    """(piece, columns) for each character, with escape sequences as zero-width pieces."""
+    pos = 0
+    for m in TERM_SEQ.finditer(text):
+        for c in text[pos:m.start()]:
+            yield c, char_width(c)
+        yield m.group(0), 0
+        pos = m.end()
+    for c in text[pos:]:
+        yield c, char_width(c)
+
+
+def text_width(text) -> int:
+    return sum(w for _, w in _tokens(text))
+
+
+def wrap_rows(text, width):
+    """One styled line as terminal rows of at most `width` columns, broken at a
+    space when one is reasonably close."""
+    width = max(width, 4)
+    rows, cur, used = [], [], 0
+    for tok, w in _tokens(text):
+        if w and used + w > width:
+            cut = None
+            if tok != " ":
+                for i in range(len(cur) - 1, 0, -1):
+                    if cur[i][0] == " ":
+                        cut = i
+                        break
+            if cut is not None and sum(x[1] for x in cur[:cut]) >= width // 3:
+                rows.append("".join(x[0] for x in cur[:cut]))
+                cur = cur[cut + 1:]
+            else:
+                rows.append("".join(x[0] for x in cur))
+                cur = []
+            used = sum(x[1] for x in cur)
+            if tok == " " and not cur:
+                continue
+        cur.append((tok, w))
+        used += w
+    rows.append("".join(x[0] for x in cur))
+    return rows
+
+
+def fit(text, width) -> str:
+    """Cut a styled line to `width` columns."""
+    out, used = [], 0
+    for tok, w in _tokens(text):
+        if used + w > width:
+            if out and width > 1:
+                out.append("…")
+            break
+        out.append(tok)
+        used += w
+    return "".join(out) + "\x1b[0m"
+
+
+def layout(line, width):
+    """(first-row prefix, continuation prefix, text) → rows."""
+    prefix, cont, text = line
+    pw = max(text_width(prefix), text_width(cont))
+    rows = wrap_rows(text, width - pw)
+    return [prefix + rows[0]] + [cont + r for r in rows[1:]]
+
+
+def md_lines(text):
+    """Light Markdown styling, one output line per input line."""
+    out, fence = [], False
+    for line in text.split("\n"):
+        if line.strip().startswith("```"):
+            fence = not fence
+            out.append(sgr(GREY, line))
+            continue
+        if fence:
+            out.append(sgr(CYAN, line))
+            continue
+        m = re.match(r"^#{1,6}\s+(.*)$", line)
+        if m:
+            out.append(sgr(BOLD, m.group(1)))
+            continue
+        line = re.sub(r"\*\*([^*]+)\*\*", lambda mm: "\x1b[1m" + mm.group(1) + "\x1b[22m", line)
+        line = re.sub(r"`([^`]+)`", lambda mm: "\x1b[36m" + mm.group(1) + "\x1b[39m", line)
+        out.append(sgr(GREY, line) if line.lstrip().startswith(">") else line)
+    return out
+
+
+def fmt_secs(ms) -> str:
+    s = max(0, int((ms or 0) / 1000))
+    return "%ds" % s if s < 60 else "%dm%02ds" % (s // 60, s % 60)
+
+
+def ago(ms) -> str:
+    secs = time.time() - (ms or 0) / 1000
+    if secs < 90:
+        return "刚才"
+    if secs < 3600:
+        return "%d 分钟前" % (secs // 60)
+    if secs < 86400:
+        return "%d 小时前" % (secs // 3600)
+    return "%d 天前" % (secs // 86400)
+
+
+def short_home(path) -> str:
+    path = path or ""
+    return "~" + path[len(HOME):] if path == HOME or path.startswith(HOME + "/") else path
+
+
+def same_dir(a, b) -> bool:
+    try:
+        return bool(a) and bool(b) and os.path.realpath(a) == os.path.realpath(b)
+    except OSError:
+        return False
+
+
+def diff_lines(diff, limit):
+    out, shown = [], 0
+    for d in plain(diff).split("\n"):
+        if d.startswith(("---", "+++")) or not d:
+            continue
+        if shown >= limit:
+            out.append(sgr(GREY, "…"))
+            break
+        color = GREEN if d.startswith("+") else RED if d.startswith("-") else GREY
+        out.append(sgr(color, d))
+        shown += 1
+    return out
+
+
+def tool_head(item, spin="⋯", now=None) -> str:
+    status = item.get("status")
+    icon = {"ok": sgr(GREEN, "✓"), "error": sgr(RED, "✗"), "declined": sgr(GREY, "⊘")}.get(status) or sgr(YELLOW, spin)
+    line = icon + " " + sgr(BOLD, item.get("tool") or "tool")
+    target = one_line(plain(item.get("target") or ""), 400)
+    if target:
+        line += "  " + (target if item.get("category") == "edit" else sgr(GREY, target))
+    if status == "declined":
+        line += sgr(GREY, "  没让它做")
+    elif status in (None, "running") and now and item.get("ts") and now - item["ts"] >= 3000:
+        line += sgr(GREY, "  " + fmt_secs(now - item["ts"]))
+    return line
+
+
+def tool_detail(item):
+    status, category = item.get("status"), item.get("category")
+    if status in (None, "running", "declined"):
+        return []  # a running edit's diff is in the request that asks for it
+    if category == "edit" and item.get("diff"):
+        return [sgr(GREY, "+%d -%d" % (item.get("add") or 0, item.get("del") or 0))] + diff_lines(item["diff"], 24)
+    if category != "command" and status != "error":
+        return []
+    out = plain(item.get("output") or "").strip("\n")
+    if not out:
+        return []
+    lines = out.split("\n")
+    keep = lines[-(6 if status == "error" else 4):]
+    rows = [sgr(GREY, "…前面还有 %d 行" % (len(lines) - len(keep)))] if len(lines) > len(keep) else []
+    return rows + [sgr(RED if status == "error" else GREY, line) for line in keep]
+
+
+def assistant_lines(item):
+    text = plain(item.get("text") or "").lstrip("\n")
+    if not item.get("streaming"):
+        text = text.rstrip()
+    if not text.strip():
+        return []
+    return [("⏺ " if i == 0 else "  ", "  ", line) for i, line in enumerate(md_lines(text))]
+
+
+NOTICE_LABELS = {"compacted": "上下文已压缩", "interrupted": "已打断"}
+NOTICE_ERRORS = {"agent_exited": "Claude 退出了", "send_failed": "没发出去", "agent_error": "出错了"}
+
+
+def item_lines(item, spin="⋯", now=None):
+    """How a timeline item reads in the terminal, as layout() lines."""
+    kind = item.get("kind")
+    if kind == "user":
+        text = plain(item.get("text") or "").strip("\n") or ("[图片]" if item.get("images") else "")
+        tag = ""
+        if item.get("images") and item.get("text"):
+            tag += sgr(GREY, "  [%d 张图]" % item["images"])
+        if item.get("origin") == "phone":
+            tag += sgr(GREY, "  ← 手机")
+        if item.get("queued"):
+            tag += sgr(GREY, "  排队中")
+        if item.get("failed"):
+            tag += sgr(RED, "  没发出去")
+        lines = text.split("\n")
+        lines[-1] += tag
+        return [(sgr("1;36", "›") + " " if i == 0 else "  ", "  ", line) for i, line in enumerate(lines)]
+    if kind == "assistant":
+        return assistant_lines(item)
+    if kind == "tool":
+        if item.get("category") in ("meta", "todo"):
+            return []
+        details = tool_detail(item)
+        return [("", "  ", tool_head(item, spin, now))] + \
+            [("  ⎿ " if i == 0 else "    ", "    ", d) for i, d in enumerate(details)]
+    if kind == "plan":
+        out = [("⏺ ", "  ", sgr(BOLD, "计划"))]
+        for st in item.get("steps") or []:
+            mark = {"completed": sgr(GREEN, "[x]"), "inProgress": sgr(YELLOW, "[~]")}.get(st.get("status"), "[ ]")
+            step = plain(st.get("step") or "")
+            out.append(("  ", "      ", mark + " " + (sgr(GREY, step) if st.get("status") == "completed" else step)))
+        if not item.get("steps") and item.get("text"):
+            out += [("  ", "  ", line) for line in md_lines(plain(item["text"]).strip())]
+        return out
+    if kind == "notice":
+        code, text = item.get("code"), plain(item.get("text") or "")
+        if code in NOTICE_LABELS:
+            return [("", "", sgr(GREY, "· " + NOTICE_LABELS[code]))]
+        title = NOTICE_ERRORS.get(code)
+        if title is None:
+            return [("", "  ", sgr(GREY, "· " + one_line((code or "") + " " + text, 300)))]
+        if code == "agent_exited":
+            return [("", "", sgr(RED, "· " + title))] + [("  ", "  ", sgr(GREY, l)) for l in text.split("\n")[-4:] if l]
+        return [("", "  ", sgr(RED, "· " + title + ("：" + one_line(text, 300) if text else "")))]
+    if kind == "turn":
+        status = item.get("status")
+        if status == "error":
+            detail = one_line(plain(item.get("text") or ""), 300)
+            return [("", "  ", sgr(RED, "✗ 这一轮出错了" + ("：" + detail if detail else "")))]
+        if status == "interrupted":
+            return [("", "", sgr(GREY, "· 已打断"))]
+        if (item.get("durationMs") or 0) >= 10000:
+            return [("", "", sgr(GREY, "· 用时 " + fmt_secs(item["durationMs"])))]
+    return []
+
+
+def request_options(req, q_index=0):
+    kind = req.get("kind")
+    if kind == "permission":
+        opts = [("allow", "允许")]
+        if req.get("canAllowSession"):
+            opts.append(("allowSession", "允许，这个会话里不再问"))
+        return opts + [("deny", "不允许"), ("note", "不允许，告诉它怎么做")]
+    if kind == "plan":
+        return [("allow", "批准，开始做"), ("allowSession", "批准，并自动接受编辑"),
+                ("deny", "不批准，接着计划"), ("note", "说说要改什么")]
+    if kind == "question":
+        q = current_question(req, q_index)
+        opts = [("opt", plain(o.get("label") or "")) for o in q.get("options") or []]
+        if q.get("allowOther", True):
+            opts.append(("other", "自己写"))
+        return opts
+    return [("deny", "跳过")]
+
+
+def current_question(req, q_index):
+    qs = req.get("questions") or []
+    return qs[min(q_index, len(qs) - 1)] if qs else {}
+
+
+def request_lines(req, sel=0, q_index=0, picked=()):
+    kind = req.get("kind")
+    out = []
+    descs = []
+    multi = False
+    if kind == "permission":
+        out.append(("", "  ", sgr("1;33", "要允许 %s 吗？" % (req.get("tool") or "这一步"))))
+        target = plain(req.get("target") or "").strip("\n")
+        lines = target.split("\n") if target else []
+        out += [("  ", "  ", line) for line in lines[:8]]
+        if len(lines) > 8:
+            out.append(("  ", "  ", sgr(GREY, "…还有 %d 行" % (len(lines) - 8))))
+        for extra in (req.get("detail"), req.get("reason")):
+            extra = one_line(plain(extra or ""), 300)
+            if extra and extra != one_line(target, 300):
+                out.append(("  ", "  ", sgr(GREY, extra)))
+        if req.get("diff"):
+            out += [("  ", "  ", d) for d in diff_lines(req["diff"], 12)]
+    elif kind == "plan":
+        out.append(("", "  ", sgr("1;33", "要按上面的计划开始做吗？")))
+    elif kind == "question":
+        qs = req.get("questions") or []
+        q = current_question(req, q_index)
+        multi = bool(q.get("multiSelect"))
+        label = (plain(q.get("header")) + " · " if q.get("header") else "") + plain(q.get("question") or "")
+        count = "  (%d/%d)" % (q_index + 1, len(qs)) if len(qs) > 1 else ""
+        out.append(("", "  ", sgr("1;33", label) + sgr(GREY, count)))
+        descs = [o.get("description") or "" for o in q.get("options") or []]
+    for i, (key, label) in enumerate(request_options(req, q_index)):
+        mark = sgr("1;36", "❯") if i == sel else " "
+        box = ("[x] " if i in picked else "[ ] ") if multi and key == "opt" else ""
+        desc = one_line(plain(descs[i]), 200) if i < len(descs) else ""
+        out.append(("", "      ", "%s %d. %s%s" % (mark, i + 1, box, label) + (sgr(GREY, "  " + desc) if desc else "")))
+    if multi:
+        hint = "数字或空格勾选，回车确定 · Esc 跳过"
+    else:
+        hint = "按数字选，或 ↑↓ 再回车 · Esc " + ("跳过" if kind == "question" else "不允许")
+    out.append(("", "  ", sgr(GREY, hint)))
+    return out
+
+
+def edit_rows(text, pos, width, prompt, placeholder=""):
+    """The input box as rows, plus where the cursor goes (row, column)."""
+    pw = text_width(prompt)
+    avail = max(width - pw, 4)
+    if not text:
+        return [prompt + fit(sgr(GREY, placeholder), avail - 1) if placeholder else prompt], 0, pw
+    rows, crow, ccol = [], 0, 0
+    idx = 0
+    for line in text.split("\n"):
+        cur, used = "", 0
+        for ch in line:
+            w = char_width(ch)
+            if used + w > avail:
+                rows.append(cur)
+                cur, used = "", 0
+            if idx == pos:
+                crow, ccol = len(rows), used
+            cur += ch
+            used += w
+            idx += 1
+        if idx == pos:
+            if used >= avail:
+                rows.append(cur)
+                cur, used = "", 0
+            crow, ccol = len(rows), used
+        rows.append(cur)
+        idx += 1
+    pad = " " * pw
+    return [(prompt if i == 0 else pad) + r for i, r in enumerate(rows)], crow, ccol + pw
+
+
+class LineEdit:
+    def __init__(self, text=""):
+        self.text, self.pos = text, len(text)
+
+    def set(self, text):
+        self.text, self.pos = text, len(text)
+
+    def insert(self, s):
+        self.text = self.text[:self.pos] + s + self.text[self.pos:]
+        self.pos += len(s)
+
+    def backspace(self):
+        if self.pos:
+            self.text = self.text[:self.pos - 1] + self.text[self.pos:]
+            self.pos -= 1
+
+    def delete(self):
+        self.text = self.text[:self.pos] + self.text[self.pos + 1:]
+
+    def left(self):
+        self.pos = max(0, self.pos - 1)
+
+    def right(self):
+        self.pos = min(len(self.text), self.pos + 1)
+
+    def line_start(self):
+        return self.text.rfind("\n", 0, self.pos) + 1
+
+    def line_end(self):
+        end = self.text.find("\n", self.pos)
+        return len(self.text) if end < 0 else end
+
+    def home(self):
+        self.pos = self.line_start()
+
+    def end(self):
+        self.pos = self.line_end()
+
+    def word_left(self):
+        p = self.pos
+        while p and not self.text[p - 1].isalnum():
+            p -= 1
+        while p and self.text[p - 1].isalnum():
+            p -= 1
+        self.pos = p
+
+    def word_right(self):
+        p, n = self.pos, len(self.text)
+        while p < n and not self.text[p].isalnum():
+            p += 1
+        while p < n and self.text[p].isalnum():
+            p += 1
+        self.pos = p
+
+    def kill_word(self):
+        end = self.pos
+        self.word_left()
+        self.text = self.text[:self.pos] + self.text[end:]
+
+    def kill_left(self):
+        start = self.line_start()
+        self.text = self.text[:start] + self.text[self.pos:]
+        self.pos = start
+
+    def kill_right(self):
+        self.text = self.text[:self.pos] + self.text[self.line_end():]
+
+    def line_up(self) -> bool:
+        start = self.line_start()
+        if start == 0:
+            return False
+        col = self.pos - start
+        prev = self.text.rfind("\n", 0, start - 1) + 1
+        self.pos = min(prev + col, start - 1)
+        return True
+
+    def line_down(self) -> bool:
+        end = self.text.find("\n", self.pos)
+        if end < 0:
+            return False
+        col = self.pos - self.line_start()
+        nxt = self.text.find("\n", end + 1)
+        self.pos = min(end + 1 + col, len(self.text) if nxt < 0 else nxt)
+        return True
+
+
+class KeyReader:
+    """Raw terminal input → ("key", sequence) and ("paste", text) events."""
+    PASTE_START, PASTE_END = "\x1b[200~", "\x1b[201~"
+
+    def __init__(self):
+        self.buf = ""
+        self.paste = None
+
+    def feed(self, data):
+        self.buf += data
+        out = []
+        while self.buf:
+            if self.paste is not None:
+                end = self.buf.find(self.PASTE_END)
+                if end < 0:
+                    keep = 0
+                    for n in range(min(len(self.buf), len(self.PASTE_END) - 1), 0, -1):
+                        if self.PASTE_END.startswith(self.buf[-n:]):
+                            keep = n
+                            break
+                    self.paste += self.buf[:len(self.buf) - keep]
+                    self.buf = self.buf[len(self.buf) - keep:]
+                    break
+                out.append(("paste", self.paste + self.buf[:end]))
+                self.paste = None
+                self.buf = self.buf[end + len(self.PASTE_END):]
+                continue
+            if self.buf[0] != "\x1b":
+                out.append(("key", self.buf[0]))
+                self.buf = self.buf[1:]
+                continue
+            if self.buf.startswith(self.PASTE_START):
+                self.paste = ""
+                self.buf = self.buf[len(self.PASTE_START):]
+                continue
+            if len(self.buf) == 1 or self.PASTE_START.startswith(self.buf):
+                break  # a lone Esc so far, or half a sequence: more may follow
+            if self.buf[1] in "[O":
+                m = CSI_KEY.match(self.buf)
+                if m:
+                    out.append(("key", m.group(0)))
+                    self.buf = self.buf[m.end():]
+                    continue
+                if re.match(r"^\x1b[\[O][0-9;]*$", self.buf):
+                    break
+            if self.buf[1] == "\x1b":
+                out.append(("key", "\x1b"))
+                self.buf = self.buf[1:]
+                continue
+            out.append(("key", self.buf[:2]))
+            self.buf = self.buf[2:]
+        return out
+
+    def flush(self):
+        """Nothing more came after an Esc: it was the Esc key."""
+        if self.paste is not None or not self.buf:
+            return []
+        rest, self.buf = self.buf[1:], ""
+        return [("key", "\x1b")] + self.feed(rest)
+
+
+def load_cli_history():
+    try:
+        with open(CLI_HISTORY) as f:
+            data = json.load(f)
+        return [h for h in data if isinstance(h, str)][-200:]
+    except Exception:
+        return []
+
+
+def save_cli_history(history):
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = CLI_HISTORY + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(history[-200:], f, ensure_ascii=False)
+        os.replace(tmp, CLI_HISTORY)
+    except OSError:
+        pass
+
+
+def start_daemon_quietly() -> bool:
+    try:
+        ensure_daemon()
+        return True
+    except SystemExit:
+        return False
+
+
+class TerminalChat:
+    def __init__(self, opts):
+        self.opts = opts
+        self.cwd = opts["cwd"]
+        self.loop = None
+        self.writer = None
+        self.calls = {}
+        self.next_id = 0
+        self.connected = False
+        self.closing = False
+        self.sid = None
+        self.creating = None            # future while session.create runs
+        self.summary = {}
+        self.new_mode = opts.get("mode")
+        self.new_model = opts.get("model")
+        self.items = {}
+        self.order = []                 # item ids in timeline order
+        self.placed = set()
+        self.floating = []              # queued messages: they join the order once Claude takes them
+        self.cursor = 0                 # order index of the first item not yet printed in full
+        self.streamed = {}              # assistant item id -> lines already printed
+        self.last_ts = 0
+        self.last_kind = None
+        self.requests = []
+        self.sel = 0
+        self.q_index = 0
+        self.answers = {}
+        self.picked = set()
+        self.note = None                # LineEdit while writing a note or an own answer for a request
+        self.req_since = 0.0
+        self.edit = LineEdit()
+        self.history = load_cli_history()
+        self.hist_pos = None
+        self.hist_draft = ""
+        self.keys = KeyReader()
+        self.esc_timer = None
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self.extra = []                 # rows to print before the next commit
+        self.flash = ("", 0.0, False)   # (text, until, is_error)
+        self.ctrl_c_at = 0.0
+        self.live_cursor = 0            # rows from the top of the drawn live area to the cursor
+        self.live_drawn = []
+        self.live_count = 0
+        self.redraw_handle = None
+        self.width, self.height = shutil.get_terminal_size((80, 24))
+        self.raw = False
+        self.fd = None
+        self.tty_state = None
+        self.models = []
+        self.commands = []
+        self.done = None
+
+    # connection ----------------------------------------------------------
+    async def connect(self):
+        if not await self.loop.run_in_executor(None, start_daemon_quietly):
+            raise OpError("no_daemon", "小助手没能启动，看看 " + LOG_PATH)
+        reader, self.writer = await asyncio.open_unix_connection(SOCK, limit=LINE_LIMIT)
+        self.connected = True
+        asyncio.ensure_future(self.read_loop(reader, self.writer))
+        await self.call("hello", app="steer-terminal", client="terminal", timeout=30)
+
+    async def read_loop(self, reader, writer):
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                try:
+                    m = json.loads(line)
+                except ValueError:
+                    continue
+                if "id" in m and "ok" in m:
+                    fut = self.calls.pop(m["id"], None)
+                    if fut and not fut.done():
+                        if m.get("ok"):
+                            fut.set_result(m.get("result") or {})
+                        else:
+                            err = m.get("error") or {}
+                            fut.set_exception(OpError(err.get("code") or "error", err.get("message") or ""))
+                elif "ev" in m:
+                    self.on_event(m)
+        except (ConnectionError, OSError, asyncio.IncompleteReadError):
+            pass
+        if writer is not self.writer:
+            return
+        self.connected = False
+        for fut in self.calls.values():
+            if not fut.done():
+                fut.set_exception(OpError("disconnected", "和小助手断开了"))
+        self.calls = {}
+        if not self.closing:
+            self.schedule_redraw()
+            asyncio.ensure_future(self.reconnect())
+
+    async def reconnect(self):
+        while not self.closing:
+            await asyncio.sleep(1)
+            try:
+                await self.connect()
+                if self.sid:
+                    snap = await self.call("session.open", sid=self.sid, agent="claude", cwd=self.cwd,
+                                           title=self.summary.get("title") or "")
+                    self.apply_snapshot(snap, fresh=False)
+                self.redraw()
+                return
+            except (OpError, OSError):
+                self.connected = False
+
+    async def call(self, op, timeout=120, **params):
+        if not self.connected or self.writer is None:
+            raise OpError("disconnected", "和小助手断开了")
+        self.next_id += 1
+        rid = self.next_id
+        fut = self.loop.create_future()
+        self.calls[rid] = fut
+        self.writer.write((json.dumps(dict(params, id=rid, op=op), ensure_ascii=False) + "\n").encode("utf-8"))
+        try:
+            return await asyncio.wait_for(fut, timeout)
+        except asyncio.TimeoutError:
+            raise OpError("timeout", "小助手没有回应")
+        finally:
+            self.calls.pop(rid, None)
+
+    async def call_quiet(self, op, **params):
+        try:
+            return await self.call(op, **params)
+        except OpError as e:
+            self.show_flash(e.message or e.code, error=True)
+            return None
+
+    # session state -------------------------------------------------------
+    def on_event(self, m):
+        ev = m.get("ev")
+        sid = m.get("sid") or (m.get("session") or {}).get("sid")
+        if self.sid is None and self.creating is not None and sid:
+            self.sid = sid  # this client opens one session at a time: it is the one being created
+        if not sid or sid != self.sid:
+            return
+        if ev == "session":
+            self.summary = m.get("session") or self.summary
+        elif ev == "item":
+            self.absorb(m.get("item") or {})
+        elif ev == "delta":
+            item = self.items.get(m.get("itemId"))
+            if item is not None:
+                item["text"] = (item.get("text") or "") + (m.get("text") or "")
+        elif ev == "request":
+            req = m.get("request") or {}
+            if req.get("rid") and all(r.get("rid") != req["rid"] for r in self.requests):
+                self.requests.append(req)
+                if len(self.requests) == 1:
+                    self.reset_request()
+        elif ev == "resolved":
+            first = self.requests[0].get("rid") if self.requests else None
+            self.requests = [r for r in self.requests if r.get("rid") != m.get("rid")]
+            if first == m.get("rid"):
+                self.reset_request()
+        self.schedule_redraw()
+
+    def absorb(self, item):
+        item_id = item.get("id")
+        if not item_id:
+            return
+        self.last_ts = max(self.last_ts, item.get("ts") or 0)
+        known = self.items.get(item_id)
+        if known is not None:
+            known.update(item)
+            item = known
+        else:
+            self.items[item_id] = item
+        if item.get("kind") == "user" and item.get("queued") and item_id not in self.placed:
+            if item_id not in self.floating:
+                self.floating.append(item_id)
+            return
+        if item_id in self.floating:
+            self.floating.remove(item_id)
+        if item_id not in self.placed:
+            self.placed.add(item_id)
+            self.order.append(item_id)
+
+    def clear_timeline(self):
+        self.items, self.order, self.placed, self.floating, self.streamed = {}, [], set(), [], {}
+        self.cursor = 0
+        self.requests = []
+        self.reset_request()
+
+    def apply_snapshot(self, snap, fresh=True):
+        self.summary = snap.get("session") or self.summary
+        self.requests = list(snap.get("requests") or [])
+        self.reset_request()
+        items = snap.get("items") or []
+        if not fresh:
+            # A restarted helper rebuilds the timeline from Claude's transcript
+            # under new ids: skip what is already on screen by its content.
+            seen = {(i.get("kind"), i.get("text")) for i in self.items.values() if i.get("kind") in ("user", "assistant")}
+            for item in items:
+                if item.get("id") in self.items:
+                    self.absorb(item)
+                elif (item.get("ts") or 0) >= self.last_ts and (item.get("kind"), item.get("text")) not in seen:
+                    self.absorb(item)
+            return
+        self.clear_timeline()
+        self.requests = list(snap.get("requests") or [])
+        busy = self.summary.get("state") in ("running", "waiting")
+        for item in items:
+            if not busy:
+                item["_hist"] = True  # whatever was left half-done is over
+            self.absorb(item)
+        skip = max(0, len(self.order) - 30)
+        earlier = (snap.get("earlier") or 0) + skip
+        if earlier:
+            self.extra.append(sgr(GREY, "…前面还有 %d 条，手机上能看全" % earlier))
+        self.cursor = skip
+
+    def settled(self, item) -> bool:
+        if item.get("_hist"):
+            return True
+        kind = item.get("kind")
+        if kind == "tool":
+            return item.get("status") not in (None, "running") or item.get("category") in ("meta", "todo")
+        if kind == "assistant":
+            return not item.get("streaming")
+        return True
+
+    def is_running(self) -> bool:
+        return self.creating is not None or self.summary.get("state") in ("running", "waiting")
+
+    def reset_request(self):
+        self.sel, self.q_index, self.answers, self.picked, self.note = 0, 0, {}, set(), None
+        self.req_since = time.time()
+
+    # drawing ---------------------------------------------------------------
+    def spacer(self, kind):
+        prev, self.last_kind = self.last_kind, kind
+        if prev is None or kind in ("turn", "notice") or (kind == "tool" and prev == "tool"):
+            return []
+        return [""]
+
+    def print_lines(self, lines, kind="info"):
+        self.extra += self.spacer(kind)
+        for line in lines:
+            self.extra += layout(line if isinstance(line, tuple) else ("", "", line), self.width)
+        self.schedule_redraw()
+
+    def take_commits(self):
+        rows = []
+        while self.cursor < len(self.order):
+            item = self.items[self.order[self.cursor]]
+            if item.get("kind") == "assistant":
+                lines = assistant_lines(item)
+                done = self.settled(item)
+                ready = len(lines) if done else max(0, len(lines) - 1)
+                start = self.streamed.get(item["id"], 0)
+                if ready > start:
+                    if start == 0:
+                        rows += self.spacer("assistant")
+                    for line in lines[start:ready]:
+                        rows += layout(line, self.width)
+                    self.streamed[item["id"]] = ready
+                if not done:
+                    break
+            elif not self.settled(item):
+                break
+            else:
+                lines = item_lines(item)
+                if lines:
+                    rows += self.spacer(item.get("kind"))
+                    for line in lines:
+                        rows += layout(line, self.width)
+            self.cursor += 1
+        return rows
+
+    def status_row(self, spin, now):
+        s = self.summary
+        if not self.connected:
+            left = sgr(RED, "和小助手断开了，正在重连…")
+        elif self.requests:
+            left = sgr(YELLOW, "等你决定")
+        elif self.is_running():
+            left = sgr(YELLOW, spin) + " 运行中"
+            if s.get("runningSince"):
+                left += " " + fmt_secs(now - s["runningSince"])
+            target = one_line(plain((s.get("activity") or {}).get("target") or ""), 60)
+            if target:
+                left += sgr(GREY, " · " + target)
+            left += sgr(GREY, " · Esc 打断")
+        else:
+            left = ""
+        if s.get("openInTerminal"):
+            place = TERMINAL_PLACES.get((s.get("terminal") or {}).get("via"), "电脑的另一个终端")
+            left = sgr(YELLOW, "这个会话还开在%s里，在这儿发消息会先关掉那边" % place) + ("  " + left if left else "")
+        mode = s.get("mode") or self.new_mode or "default"
+        right = MODE_LABELS.get(mode, mode) + " · " + (s.get("model") or self.new_model or "默认模型")
+        if (s.get("terminals") or 0) > 1:
+            right = "另有终端开着 · " + right
+        row = (left + "  " if left else "") + sgr(GREY, right)
+        return fit(row, self.width - 1)
+
+    def live(self):
+        w = self.width
+        now = now_ms()
+        spin = SPINNER[int(time.time() * 10) % len(SPINNER)]
+        rows = []
+        for item_id in self.order[self.cursor:]:
+            item = self.items[item_id]
+            if item.get("kind") == "assistant":
+                lines = assistant_lines(item)[self.streamed.get(item_id, 0):]
+            else:
+                lines = item_lines(item, spin, now)
+            for line in lines:
+                rows += layout(line, w)
+        for item_id in self.floating:
+            for line in item_lines(self.items[item_id]):
+                rows += layout(line, w)
+        if self.requests:
+            if rows:
+                rows.append("")
+            for line in request_lines(self.requests[0], self.sel, self.q_index, self.picked):
+                rows += layout(line, w)
+            if len(self.requests) > 1:
+                rows.append(sgr(GREY, "  还有 %d 个请求" % (len(self.requests) - 1)))
+        rows.append(self.status_row(spin, now))
+        if self.note is not None:
+            asking = self.requests and self.requests[0].get("kind") == "question"
+            prompt = sgr("1;33", "回答 › " if asking else "说明 › ")
+            erows, crow, ccol = edit_rows(self.note.text, self.note.pos, w, prompt,
+                                          "回车发出" + ("" if asking else "，空着就是直接不允许") + " · Esc 返回")
+        else:
+            if self.requests:
+                placeholder = "先处理上面的请求"
+            elif self.suggestion():
+                placeholder = one_line(plain(self.suggestion()), 200) + "  · Tab 采用"
+            else:
+                placeholder = "" if self.sid else "说点什么开始，手机上也会看到 · /help 看快捷键"
+            erows, crow, ccol = edit_rows(self.edit.text, self.edit.pos, w, sgr("1;36", "›") + " ", placeholder)
+        below = self.completion_rows()
+        text, until, is_error = self.flash
+        if text and time.time() < until:
+            below.append(fit(sgr(RED if is_error else GREY, text), w - 1))
+        limit = max(3, self.height - len(erows) - len(below) - 1)
+        if len(rows) > limit:
+            rows = rows[-limit:]
+        return rows + erows + below, len(rows) + crow, ccol
+
+    def completion_rows(self):
+        text = self.edit.text
+        if self.note is not None or self.requests or not text.startswith("/") or any(c.isspace() for c in text):
+            return []
+        rows = []
+        for name, desc in self.command_matches(text[1:])[:6]:
+            rows.append(fit("  " + sgr(CYAN, "/" + name) + (sgr(GREY, "  " + desc) if desc else ""), self.width - 1))
+        return rows
+
+    def command_matches(self, prefix):
+        seen, out = set(), []
+        for name, desc in LOCAL_COMMANDS + self.commands:
+            if name.startswith(prefix) and name not in seen:
+                seen.add(name)
+                out.append((name, desc))
+        return out
+
+    def schedule_redraw(self):
+        if self.redraw_handle is None and self.loop is not None:
+            self.redraw_handle = self.loop.call_later(0.03, self.redraw)
+
+    def redraw(self):
+        if self.redraw_handle is not None:
+            self.redraw_handle.cancel()
+            self.redraw_handle = None
+        if not self.raw:
+            return
+        self.width, self.height = shutil.get_terminal_size((80, 24))
+        commits, self.extra = self.extra + self.take_commits(), []
+        live, crow, ccol = self.live()
+        out = ["\x1b[?2026h\x1b[?25l"]
+        if self.live_cursor:
+            out.append("\x1b[%dA" % self.live_cursor)
+        out.append("\r\x1b[J")
+        for row in commits:
+            out.append(row + "\x1b[0m\r\n")
+        for i, row in enumerate(live):
+            out.append(row + "\x1b[0m" + ("\r\n" if i < len(live) - 1 else ""))
+        up = len(live) - 1 - crow
+        if up > 0:
+            out.append("\x1b[%dA" % up)
+        out.append("\r")
+        if ccol:
+            out.append("\x1b[%dC" % ccol)
+        out.append("\x1b[?25h\x1b[?2026l")
+        self.live_cursor, self.live_drawn, self.live_count = crow, live[:crow], len(live)
+        self.write("".join(out))
+
+    def on_resize(self):
+        width, _ = shutil.get_terminal_size((80, 24))
+        if width != self.width and self.live_drawn:
+            # The terminal re-wrapped what is drawn; find the top of it again.
+            self.live_cursor = sum(max(1, -(-text_width(r) // max(width, 1))) for r in self.live_drawn)
+        self.redraw()
+
+    def tick(self):
+        if self.closing:
+            return
+        if self.is_running() or self.requests or self.flash[1] > time.time() - 0.2:
+            self.redraw()
+        self.loop.call_later(0.1, self.tick)
+
+    def show_flash(self, text, secs=4, error=False):
+        self.flash = (text, time.time() + secs, error)
+        self.schedule_redraw()
+
+    def write(self, text):
+        data = text.encode("utf-8", "replace")
+        while data:
+            try:
+                n = os.write(1, data)
+            except BlockingIOError:
+                time.sleep(0.01)
+                continue
+            data = data[n:]
+
+    # terminal mode ---------------------------------------------------------
+    def enter_raw(self):
+        import termios
+        self.fd = sys.stdin.fileno()
+        self.tty_state = termios.tcgetattr(self.fd)
+        mode = termios.tcgetattr(self.fd)
+        mode[0] &= ~(termios.ICRNL | termios.INLCR | termios.IGNCR | termios.IXON)
+        mode[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG | termios.IEXTEN)
+        mode[6][termios.VMIN] = 1
+        mode[6][termios.VTIME] = 0
+        termios.tcsetattr(self.fd, termios.TCSANOW, mode)
+        self.write("\x1b[?2004h")
+        self.raw = True
+        self.live_cursor = 0
+        self.loop.add_reader(self.fd, self.on_stdin)
+
+    def leave_raw(self):
+        if not self.raw:
+            return
+        import termios
+        self.flash = ("", 0.0, False)
+        self.redraw()
+        self.loop.remove_reader(self.fd)
+        self.raw = False
+        # Leave the input area on screen, move below it.
+        below = self.live_count - 1 - self.live_cursor
+        self.write(("\x1b[%dB" % below if below > 0 else "") + "\r\n\x1b[?2004l\x1b[?25h")
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.tty_state)
+
+    def suspend(self):
+        self.leave_raw()
+        os.kill(os.getpid(), signal.SIGTSTP)
+        self.enter_raw()
+        self.redraw()
+
+    # input -------------------------------------------------------------------
+    def on_stdin(self):
+        try:
+            data = os.read(self.fd, 4096)
+        except OSError:
+            return
+        if not data:
+            self.quit()
+            return
+        if self.esc_timer is not None:
+            self.esc_timer.cancel()
+            self.esc_timer = None
+        for kind, value in self.keys.feed(self.decoder.decode(data)):
+            self.on_key(kind, value)
+        if self.keys.buf:
+            self.esc_timer = self.loop.call_later(0.05, self.on_esc_timeout)
+        self.redraw()
+
+    def on_esc_timeout(self):
+        self.esc_timer = None
+        for kind, value in self.keys.flush():
+            self.on_key(kind, value)
+        self.redraw()
+
+    def on_key(self, kind, k):
+        if kind == "paste":
+            text = plain(k.replace("\r\n", "\n").replace("\r", "\n"))
+            (self.note if self.note is not None else self.edit).insert(text)
+            return
+        if k == "\x03":
+            return self.on_ctrl_c()
+        if k == "\x1a":
+            return self.suspend()
+        if k == "\x0c":
+            self.write("\x1b[H\x1b[2J")
+            self.live_cursor = 0
+            return
+        if self.requests and self.note is None:
+            return self.on_request_key(k)
+        ed = self.note if self.note is not None else self.edit
+        if k == "\r":
+            if ed.text.endswith("\\") and ed.pos == len(ed.text):
+                ed.backspace()
+                ed.insert("\n")
+            elif self.note is not None:
+                self.submit_note()
+            elif ed.text.strip():
+                text = ed.text
+                ed.set("")
+                self.hist_pos = None
+                asyncio.ensure_future(self.submit(text))
+            return
+        if k in ("\n", "\x1b\r", "\x1b\n", "\x1b[13;2u"):
+            ed.insert("\n")
+        elif k in ("\x7f", "\x08"):
+            ed.backspace()
+        elif k == "\x1b[3~":
+            ed.delete()
+        elif k in ("\x1b[D", "\x1bOD", "\x02"):
+            ed.left()
+        elif k in ("\x1b[C", "\x1bOC", "\x06"):
+            ed.right()
+        elif k in ("\x1b[H", "\x1bOH", "\x1b[1~", "\x01"):
+            ed.home()
+        elif k in ("\x1b[F", "\x1bOF", "\x1b[4~", "\x05"):
+            ed.end()
+        elif k in ("\x1bb", "\x1b[1;3D", "\x1b[1;5D", "\x1b[1;9D"):
+            ed.word_left()
+        elif k in ("\x1bf", "\x1b[1;3C", "\x1b[1;5C", "\x1b[1;9C"):
+            ed.word_right()
+        elif k == "\x15":
+            ed.kill_left()
+        elif k == "\x0b":
+            ed.kill_right()
+        elif k in ("\x17", "\x1b\x7f"):
+            ed.kill_word()
+        elif k in ("\x1b[A", "\x1bOA"):
+            if not ed.line_up() and ed is self.edit:
+                self.history_move(-1)
+        elif k in ("\x1b[B", "\x1bOB"):
+            if not ed.line_down() and ed is self.edit:
+                self.history_move(1)
+        elif k == "\x04":
+            if ed.text:
+                ed.delete()
+            elif ed is self.edit:
+                self.quit()
+        elif k == "\x1b":
+            if self.note is not None:
+                self.note = None
+            elif self.is_running():
+                asyncio.ensure_future(self.interrupt())
+        elif k == "\x1b[Z":
+            asyncio.ensure_future(self.cycle_mode())
+        elif k == "\t":
+            self.complete()
+        elif len(k) == 1 and k >= " ":
+            ed.insert(k)
+
+    def history_move(self, step):
+        if not self.history:
+            return
+        if self.hist_pos is None:
+            if step > 0:
+                return
+            self.hist_draft = self.edit.text
+            self.hist_pos = len(self.history)
+        self.hist_pos += step
+        if self.hist_pos >= len(self.history):
+            self.hist_pos = None
+            self.edit.set(self.hist_draft)
+            return
+        self.hist_pos = max(0, self.hist_pos)
+        self.edit.set(self.history[self.hist_pos])
+
+    def suggestion(self):
+        """Claude's guess at the next message, offered while the input is empty."""
+        if self.edit.text or self.requests or self.is_running():
+            return ""
+        return self.summary.get("suggestion") or ""
+
+    def complete(self):
+        text = self.edit.text
+        if not text and self.suggestion():
+            self.edit.set(plain(self.suggestion()))
+            return
+        if not text.startswith("/") or any(c.isspace() for c in text):
+            return
+        names = [n for n, _ in self.command_matches(text[1:])]
+        if not names:
+            return
+        common = os.path.commonprefix(names)
+        self.edit.set("/" + (names[0] + " " if len(names) == 1 else common))
+
+    def on_ctrl_c(self):
+        if self.note is not None:
+            self.note = None
+        elif self.edit.text:
+            self.edit.set("")
+            self.hist_pos = None
+        elif self.is_running() and not self.requests:
+            asyncio.ensure_future(self.interrupt())
+        elif time.time() - self.ctrl_c_at < 2:
+            self.quit()
+        else:
+            self.ctrl_c_at = time.time()
+            self.show_flash("再按一次 Ctrl+C 离开（会话留在小助手里，手机上能接着用）", 2)
+
+    def on_request_key(self, k):
+        req = self.requests[0]
+        if time.time() < self.req_since + 0.4:
+            return  # typed for the input box just as the request appeared
+        opts = request_options(req, self.q_index)
+        multi = req.get("kind") == "question" and bool(current_question(req, self.q_index).get("multiSelect"))
+        if k in ("\x1b[A", "\x1bOA"):
+            self.sel = (self.sel - 1) % len(opts)
+        elif k in ("\x1b[B", "\x1bOB", "\t"):
+            self.sel = (self.sel + 1) % len(opts)
+        elif k.isdigit() and 1 <= int(k) <= len(opts):
+            self.sel = int(k) - 1
+            if multi and opts[self.sel][0] == "opt":
+                self.picked ^= {self.sel}
+            else:
+                self.choose()
+        elif k == " " and multi and opts[self.sel][0] == "opt":
+            self.picked ^= {self.sel}
+        elif k == "\r":
+            self.choose()
+        elif k == "\x1b":
+            self.respond("deny")
+        elif k == "\x04":
+            self.quit()
+
+    def choose(self):
+        req = self.requests[0]
+        opts = request_options(req, self.q_index)
+        key, label = opts[self.sel]
+        if req.get("kind") == "question":
+            if key == "other":
+                self.note = LineEdit()
+            elif current_question(req, self.q_index).get("multiSelect"):
+                labels = [opts[i][1] for i in sorted(self.picked) if opts[i][0] == "opt"] or [label]
+                self.answer_question(labels)
+            else:
+                self.answer_question(label)
+        elif key == "note":
+            self.note = LineEdit()
+        else:
+            self.respond(key)
+
+    def answer_question(self, answer):
+        req = self.requests[0]
+        qs = req.get("questions") or []
+        q = current_question(req, self.q_index)
+        self.answers[q.get("id") or str(self.q_index)] = answer
+        if self.q_index + 1 < len(qs):
+            self.q_index += 1
+            self.sel, self.picked, self.note = 0, set(), None
+            return
+        self.respond("allow", answers=dict(self.answers))
+
+    def submit_note(self):
+        text = self.note.text.strip()
+        if self.requests[0].get("kind") == "question":
+            if text:
+                self.note = None
+                self.answer_question(text)
+            return
+        self.note = None
+        self.respond("deny", message=text)
+
+    def respond(self, decision, message="", answers=None):
+        req = self.requests.pop(0)
+        self.reset_request()
+        asyncio.ensure_future(self.call_quiet("session.respond", sid=self.sid, rid=req.get("rid"),
+                                              decision=decision, message=message, answers=answers or {}))
+
+    # actions -------------------------------------------------------------------
+    async def submit(self, text):
+        text = text.strip("\n")
+        if not text.strip():
+            return
+        if not self.history or self.history[-1] != text:
+            self.history.append(text)
+            save_cli_history(self.history)
+        if text.startswith("/") and await self.local_command(text):
+            return
+        if self.creating is not None:
+            await asyncio.shield(self.creating)
+        try:
+            if self.sid:
+                await self.call("session.send", sid=self.sid, text=text, images=[])
+            else:
+                await self.create(text)
+        except OpError as e:
+            self.show_flash("没发出去：" + (e.message or e.code), 8, error=True)
+        self.schedule_redraw()
+
+    async def create(self, text):
+        self.creating = self.loop.create_future()
+        try:
+            r = await self.call("session.create", timeout=180, agent="claude", cwd=self.cwd, text=text, images=[],
+                                model=self.new_model, mode=self.new_mode)
+            self.sid = (r.get("session") or {}).get("sid") or self.sid
+            self.summary = r.get("session") or self.summary
+        finally:
+            fut, self.creating = self.creating, None
+            fut.set_result(None)
+
+    async def local_command(self, text) -> bool:
+        name, _, arg = text[1:].partition(" ")
+        name, arg = name.lower(), arg.strip()
+        if name in ("exit", "quit"):
+            self.quit()
+        elif name == "help":
+            self.print_lines([sgr(GREY, line) for line in CLI_HELP.split("\n")])
+        elif name in ("new", "clear", "reset"):
+            await self.new_session()
+        elif name == "model":
+            await self.cmd_model(arg)
+        elif name == "mode":
+            await self.cmd_mode(arg)
+        elif name == "status":
+            s = self.summary
+            mode = s.get("mode") or self.new_mode or "default"
+            self.print_lines([sgr(GREY, line) for line in (
+                "会话  " + (self.sid or "还没开始，发第一条消息时创建"),
+                "文件夹  " + short_home(self.cwd),
+                "模式  %s（%s）" % (MODE_LABELS.get(mode, mode), mode),
+                "模型  " + (s.get("model") or self.new_model or "默认模型"))])
+        else:
+            return False
+        return True
+
+    async def new_session(self):
+        if self.sid:
+            await self.call_quiet("session.close", sid=self.sid)
+        self.new_mode = self.summary.get("mode") or self.new_mode
+        self.new_model = self.summary.get("model") or self.new_model
+        self.sid, self.summary = None, {}
+        self.clear_timeline()
+        self.print_lines([sgr(GREY, "── 新会话 · %s ──" % short_home(self.cwd))])
+
+    async def cmd_model(self, arg):
+        current = self.summary.get("model") or self.new_model
+        if not arg:
+            lines = [sgr(GREY, "模型（/model <名字> 换）：")]
+            for m in self.models:
+                mark = sgr("1;36", "❯") if m.get("id") == current else " "
+                lines.append("%s %s%s" % (mark, m.get("id"), sgr(GREY, "  " + (m.get("name") or "")) if m.get("name") else ""))
+            self.print_lines(lines)
+            return
+        if self.sid:
+            r = await self.call_quiet("session.setModel", sid=self.sid, model=arg)
+            if r is None:
+                return
+            self.summary = r
+        else:
+            self.new_model = arg
+        self.show_flash("模型：" + arg)
+
+    async def cmd_mode(self, arg):
+        if not arg:
+            current = self.summary.get("mode") or self.new_mode or "default"
+            lines = [sgr(GREY, "权限模式（/mode <名字> 换，或 Shift+Tab 轮换）：")]
+            for mode in MODE_ORDER:
+                mark = sgr("1;36", "❯") if mode == current else " "
+                lines.append("%s %s%s" % (mark, mode, sgr(GREY, "  " + MODE_LABELS[mode])))
+            self.print_lines(lines)
+            return
+        names = {v: k for k, v in MODE_LABELS.items()}
+        mode = arg if arg in MODE_LABELS else names.get(arg)
+        if mode is None:
+            self.show_flash("没有这个模式：" + arg, error=True)
+            return
+        await self.set_mode(mode)
+
+    async def set_mode(self, mode):
+        if self.sid:
+            r = await self.call_quiet("session.setMode", sid=self.sid, mode=mode)
+            if r is None:
+                return
+            self.summary = r
+        else:
+            self.new_mode = mode
+        self.show_flash("权限模式：" + MODE_LABELS.get(mode, mode))
+
+    async def cycle_mode(self):
+        current = self.summary.get("mode") or self.new_mode or "default"
+        pos = MODE_ORDER.index(current) if current in MODE_ORDER else -1
+        await self.set_mode(MODE_ORDER[(pos + 1) % len(MODE_ORDER)])
+
+    async def interrupt(self):
+        if self.sid:
+            await self.call_quiet("session.interrupt", sid=self.sid)
+
+    async def load_info(self):
+        info = await self.call_quiet("agent.info", agent="claude", cwd=self.cwd)
+        if info:
+            self.models = info.get("models") or []
+        found = await self.call_quiet("agent.commands", agent="claude", cwd=self.cwd)
+        cmds = (found or {}).get("commands") or (info or {}).get("commands") or []
+        self.commands = [(c.get("name"), one_line(c.get("description") or "", 80)) for c in cmds if c.get("name")]
+
+    def quit(self):
+        self.closing = True
+        if self.done is not None and not self.done.done():
+            self.done.set_result(None)
+
+    # startup -------------------------------------------------------------------
+    async def pick_session(self):
+        o = self.opts
+        if o.get("resume") is None and not o.get("continue"):
+            return
+        listing = await self.call("sessions.list", timeout=60)
+        sessions = [s for s in listing.get("sessions") or [] if s.get("agent") == "claude"]
+        here = [s for s in sessions if same_dir(s.get("cwd"), self.cwd)]
+        chosen = None
+        if o.get("resume"):
+            matches = [s for s in sessions if s["sid"].startswith(o["resume"])]
+            if not matches:
+                raise OpError("not_found", "没找到会话 " + o["resume"])
+            chosen = matches[0]
+        elif o.get("continue"):
+            if not here:
+                print("这个文件夹还没有 Claude 会话，开一个新的。")
+                return
+            chosen = here[0]
+        else:
+            pool = (here or sessions)[:15]
+            if not pool:
+                print("还没有 Claude 会话，开一个新的。")
+                return
+            print("选一个会话（直接回车就开新的）" + ("：" if here else "，这个文件夹没有，下面是最近的："))
+            for i, s in enumerate(pool, 1):
+                where = "" if here else "  " + short_home(s.get("cwd"))
+                print("  %2d. %s  %s%s" % (i, one_line(s.get("title") or s.get("lastText") or s["sid"][:8], 50),
+                                          sgr(GREY, ago(s.get("updatedAt"))), sgr(GREY, where)))
+            line = (await self.loop.run_in_executor(None, input, "> ")).strip()
+            if not line:
+                return
+            if not line.isdigit() or not 1 <= int(line) <= len(pool):
+                raise OpError("bad_choice", "没有这一项：" + line)
+            chosen = pool[int(line) - 1]
+        snap = await self.call("session.open", sid=chosen["sid"], agent="claude", cwd=chosen.get("cwd") or self.cwd,
+                               title=chosen.get("title") or "")
+        self.sid = chosen["sid"]
+        if chosen.get("cwd") and os.path.isdir(chosen["cwd"]):
+            self.cwd = chosen["cwd"]
+        self.apply_snapshot(snap)
+
+    async def run(self):
+        self.loop = asyncio.get_event_loop()
+        self.done = self.loop.create_future()
+        await self.connect()
+        await self.pick_session()
+        asyncio.ensure_future(self.load_info())
+        self.enter_raw()
+        for sig, handler in ((signal.SIGWINCH, self.on_resize), (signal.SIGHUP, self.quit), (signal.SIGTERM, self.quit)):
+            self.loop.add_signal_handler(sig, handler)
+        try:
+            header = "Steer · Claude · %s · 手机上也能看、能接着聊" % short_home(self.cwd)
+            self.extra.insert(0, sgr(GREY, header))
+            self.last_kind = "info"
+            self.redraw()
+            self.tick()
+            if self.opts.get("prompt"):
+                asyncio.ensure_future(self.submit(self.opts["prompt"]))
+            await self.done
+        finally:
+            self.closing = True
+            self.leave_raw()
+            if self.writer is not None:
+                self.writer.close()
+        if self.sid:
+            print(sgr(GREY, "会话留在小助手里，手机上能接着用。回到这里：steer -r %s" % self.sid[:8]))
+
+
+def cmd_claude(argv):
+    import argparse
+    parser = argparse.ArgumentParser(prog="steer", description="和手机共用同一个 Claude 会话的终端界面。")
+    parser.add_argument("-c", "--continue", dest="cont", action="store_true", help="接着这个文件夹最近的会话")
+    parser.add_argument("-r", "--resume", nargs="?", const="", default=None, metavar="ID",
+                        help="接着某个会话；不写 ID 就列出来选")
+    parser.add_argument("-m", "--model", help="模型，比如 haiku、sonnet、opus")
+    parser.add_argument("--permission-mode", "--mode", dest="mode", choices=MODE_ORDER, help="权限模式")
+    parser.add_argument("--dangerously-skip-permissions", action="store_true", help="同 --mode bypassPermissions")
+    parser.add_argument("prompt", nargs="*", help="第一条消息")
+    args = parser.parse_args(argv)
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        sys.stderr.write("steer: 要在终端里用\n")
+        sys.exit(2)
+    opts = {"cwd": os.getcwd(), "continue": args.cont, "resume": args.resume, "model": args.model,
+            "mode": "bypassPermissions" if args.dangerously_skip_permissions else args.mode,
+            "prompt": " ".join(args.prompt)}
+    chat = TerminalChat(opts)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(chat.run())
+    except OpError as e:
+        sys.stderr.write("steer: %s\n" % (e.message or e.code))
+        sys.exit(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.close()
+
+
+def cmd_install_cli(args):
+    """steerd.py install-cli [dir]: put a `steer` command on PATH (default ~/.local/bin)."""
+    target_dir = os.path.expanduser(args[0]) if args else os.path.join(HOME, ".local", "bin")
+    script = os.path.abspath(__file__)
+    installed = os.path.join(HOME, ".local", "share", "steer", "steerd.py")
+    if script == installed:
+        script = '"$HOME/.local/share/steer/steerd.py"'
+    else:
+        script = shlex.quote(script)
+    os.makedirs(target_dir, exist_ok=True)
+    path = os.path.join(target_dir, "steer")
+    with open(path, "w") as f:
+        f.write("#!/bin/sh\n# Steer: the Claude session the phone also sees. Written by steerd.py install-cli.\n"
+                "exec python3 %s claude \"$@\"\n" % script)
+    os.chmod(path, 0o755)
+    print("installed", path)
+
+
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else "attach"
     if cmd == "attach":
@@ -3507,6 +5072,10 @@ def main(argv):
         cmd_doctor()
     elif cmd == "push-key":
         cmd_push_key(argv[2:])
+    elif cmd == "claude":
+        cmd_claude(argv[2:])
+    elif cmd == "install-cli":
+        cmd_install_cli(argv[2:])
     else:
         print(__doc__)
         sys.exit(2)

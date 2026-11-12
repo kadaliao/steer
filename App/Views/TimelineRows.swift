@@ -34,6 +34,9 @@ struct UserBubble: View {
                         .padding(.vertical, 10)
                         .background(RoundedRectangle(cornerRadius: 18).fill(Color(.secondarySystemBackground)))
                 }
+                if item.origin == "terminal" {
+                    Label("电脑上发的", systemImage: "terminal").font(.caption2).foregroundStyle(.secondary)
+                }
                 if item.queued == true {
                     Label("排队中，这一步做完就处理", systemImage: "clock").font(.caption2).foregroundStyle(.secondary)
                 }

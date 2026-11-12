@@ -168,7 +168,12 @@ struct ChatView: View {
                 }
             }
             intentBanner
-            if chat.summary.openInTerminal == true {
+            if (chat.summary.terminals ?? 0) > 0, chat.summary.openInTerminal != true {
+                Label("电脑终端里也开着这个会话（steer），两边实时同步，谁发都行。", systemImage: "terminal")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 6)
+            } else if chat.summary.openInTerminal == true {
                 Label(terminalNote, systemImage: "terminal")
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)

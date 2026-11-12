@@ -10,7 +10,9 @@ Steer 通过 SSH 登录你的电脑，在那里运行 Claude Code / Codex，手�
 - 新建：点 ＋，打字，发送就开始。项目和 agent 默认上次用的。
 - 对话：Claude 猜的下一句一点就发，`@` 搜项目文件，`/` 选命令和技能（Codex 用 `$`），可以发截图；运行中照样能发消息。
 - 多台电脑：同时连着，首页看全部或只看一台。
-- 和电脑终端同步：Codex 两边实时同步；Claude 在终端开着时手机实时跟着看，手机发消息时自动接管，做完放回 herdr / tmux 窗格。
+- 和电脑终端同步：Codex 两边实时同步。Claude 想两边同时用，就在电脑终端里用 `steer` 代替 `claude`（见下面），
+  和 Codex 一样两边实时同步、谁发都行；用官方的 `claude` 开着时，手机实时跟着看，手机发消息时先接管，
+  做完放回 herdr / tmux 窗格（普通终端窗口放不回去，回电脑后 `claude -c` 接着）。
 - 断线：agent 在电脑上继续跑，回到 App 自动补齐。
 
 设计和取舍见 [docs/design.md](docs/design.md)，App 与主机助手之间的协议见
@@ -24,6 +26,19 @@ Steer 通过 SSH 登录你的电脑，在那里运行 Claude Code / Codex，手�
   在 macOS 上它注册为 LaunchAgent `com.kadaliao.steer.helper`，这样 Claude 能读到钥匙串里的登录。
   卸载：`launchctl bootout gui/$(id -u)/com.kadaliao.steer.helper`，然后删除
   `~/Library/LaunchAgents/com.kadaliao.steer.helper.plist` 和 `~/.local/share/steer`。
+
+## 在电脑终端里用同一个会话（steer）
+
+```sh
+python3 ~/.local/share/steer/steerd.py install-cli   # 装一个 steer 命令到 ~/.local/bin
+cd 你的项目 && steer              # 新会话；steer -c 接着这个文件夹最近的；steer -r 列出来选
+```
+
+`steer` 是主机助手自带的终端界面，和手机连的是同一个后台 Claude 进程：手机发的消息、Claude 的回复、
+授权和提问在两边同时出现，哪边先回答算哪边的。任何终端都能用（Terminal、iTerm2、Ghostty、
+VS Code、herdr、tmux）。离开 `steer` 不会停掉会话，手机上能接着用。支持 `-m 模型`、
+`--mode 权限模式`、`--dangerously-skip-permissions`；`/help` 看快捷键。它不是官方的 Claude Code 界面，
+官方界面里的部分功能没有。
 
 ## 推送通知（可选）
 

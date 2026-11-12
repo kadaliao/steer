@@ -16,7 +16,7 @@ process elsewhere) and relays stdin/stdout to its Unix socket
 
 | op | params | result |
 | --- | --- | --- |
-| `hello` | `app` | `helper`, `proto`, `home`, `host`, `platform`, `python`, `launchd`, `agents{claude,codex: {path, version} \| null}`, `push` (has an APNs key) |
+| `hello` | `app`, `client?` (`terminal` for `steerd.py claude`) | `helper`, `proto`, `home`, `host`, `platform`, `python`, `launchd`, `agents{claude,codex: {path, version} \| null}`, `push` (has an APNs key) |
 | `push.register` | `token` (hex), `env` (`sandbox`/`production`), `host` (the app's id for this host), `topic` (bundle id) | `configured` |
 | `push.test` | — | `sent`, `errors[]` |
 | `watch` | — | like `sessions.list`, and from now on `session` events for every session |
@@ -60,10 +60,13 @@ appends to an assistant item's `text`.
 
 `sid, agent, cwd, title, state (idle|running|waiting), needs (permission|question|plan|null),
 lastText, activity{category,target}, updatedAt (ms), runningSince (ms), model, mode,
-source (steer|desktop), live, error, suggestion, openInTerminal, terminal{via,status}, handback`
+source (steer|desktop), live, error, suggestion, terminals, openInTerminal, terminal{via,status}, handback`
 
 - `suggestion`: Claude's predicted next user message (`--prompt-suggestions`),
   present only while the session is idle; cleared when a turn starts.
+- `terminals`: how many `steerd.py claude` terminals have the session open
+  (clients that said `client: "terminal"` in `hello`). They share the
+  helper's process with the phone, so nothing needs taking over.
 - `openInTerminal` (Claude only): a terminal on the host has this session open
   right now, per Claude Code's registry `~/.claude/sessions/<pid>.json`
   (`kind: interactive`, `entrypoint: cli`, live pid). `terminal.via` is
@@ -84,8 +87,11 @@ session subscribes with a bare `thread/resume`; policy, model and sandbox
 travel with each `turn/start`. Without the daemon the helper falls back to a
 private `codex app-server` child (`STEER_CODEX_DAEMON=0` forces that).
 
-**Claude** has no second-client protocol, so one process owns a session at a
-time:
+**Claude** has no second-client protocol. `steerd.py claude` (installed as
+`steer` by `steerd.py install-cli`) is a terminal client of this same protocol:
+a session it opens runs in the helper's own process, so the phone and that
+terminal are two views of one live session, like Codex. A session open in
+Claude Code's own terminal UI is a second process, so one owns it at a time:
 
 - *Following*: while a terminal has the session open, the helper tails its
   transcript (new lines become `item` events) and mirrors the registry
@@ -98,14 +104,22 @@ time:
   for `STEER_HANDBACK_DELAY` seconds (60), the helper stops its process and
   types `claude <the terminal's own flags> --resume <id>` into the original
   pane, if that pane is still at its shell prompt.
+  Skipped while a `steer` terminal has the session open.
 - `session.interrupt` on a session a herdr/tmux pane is running sends Escape
   there.
+
+Claude runs with `--replay-user-messages`: it echoes each message as it takes
+it. A message sent while a turn runs is usually taken into that same turn
+(Claude Code shows it at the next tool boundary), so the echo, not the end of
+the turn, is when a `queued` user item stops waiting. The transcript records
+those as `attachment` lines of type `queued_command`.
 
 ## Notifications
 
 The helper pushes straight to APNs (no relay): an ES256 token signed with
 the team's APNs key by the system `openssl`, sent with `curl --http2`. Only
-turns started from the phone (`session.send` / `session.create`) notify:
+turns started from the phone (`session.send` / `session.create` from a client
+that is not a `steer` terminal) notify:
 when they need an answer (`等你批准：…`, `等你回答：…`, `等你批准计划`), and
 when they end (`做完了：<last reply>`, or `出错了：…`; interrupted turns stay
 quiet). Payload: `aps.alert{title: "<project> · <title>", body}`, `aps.thread-id`
@@ -130,7 +144,7 @@ dropped. The key is installed per host with
 
 | kind | fields |
 | --- | --- |
-| `user` | `text`, `images`, `queued`, `failed` |
+| `user` | `text`, `images`, `queued`, `failed`, `origin` (`phone`/`terminal`, only on messages sent through the helper) |
 | `assistant` | `text`, `streaming`, `phase` |
 | `tool` | `tool`, `category` (command, read, edit, search, web, agent, skill, mcp, meta, other), `target`, `detail`, `command`, `status` (running, ok, error, declined), `output` (tail), `diff`, `add`, `del`, `exitCode`, `endTs` |
 | `plan` | `steps[{step, status}]`, `text` |

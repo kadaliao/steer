@@ -23,6 +23,9 @@ class FakeHub:
     def session_changed(self, s, quiet=False, urgent=False):
         pass
 
+    def terminal_viewers(self, sid):
+        return 0
+
     def remember_claude_info(self, info, cwd=None):
         pass
 
@@ -474,3 +477,275 @@ class MakeDirTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QueuedMessageTests(unittest.TestCase):
+    """Claude takes a message sent mid-turn into the running turn; its replay says when."""
+
+    def queued_session(self, replays):
+        s = claude_session()
+        s.replays = replays
+        s.state = "running"
+        s.put({"id": "u-b", "kind": "user", "text": "also say bye", "queued": True})
+        s.queued = ["u-b"]
+        return s
+
+    def test_a_replayed_message_stops_waiting_and_the_turn_can_end(self):
+        s = self.queued_session(replays=True)
+        s.on_message({"type": "user", "isReplay": True, "message": {"role": "user", "content": "first"}})
+        self.assertEqual(s.queued, ["u-b"])                      # not ours to unqueue
+        s.on_message({"type": "user", "isReplay": True, "message": {"role": "user", "content": "also say bye"}})
+        self.assertEqual(s.queued, [])
+        self.assertFalse(s.get("u-b")["queued"])
+        s.on_message({"type": "result", "subtype": "success", "duration_ms": 10})
+        self.assertEqual(s.state, "idle")
+
+    def test_a_message_not_yet_taken_keeps_the_session_running(self):
+        s = self.queued_session(replays=True)
+        s.on_message({"type": "result", "subtype": "success", "duration_ms": 10})
+        self.assertEqual(s.state, "running")
+        self.assertTrue(s.get("u-b")["queued"])                  # until Claude echoes it
+
+    def test_without_replays_the_next_turn_takes_it(self):
+        s = self.queued_session(replays=False)
+        s.on_message({"type": "result", "subtype": "success", "duration_ms": 10})
+        self.assertEqual(s.state, "running")
+        self.assertFalse(s.get("u-b")["queued"])
+
+    def test_transcript_keeps_messages_taken_mid_turn(self):
+        t = steerd.ClaudeTranscript("/w")
+        t.feed({"type": "attachment", "uuid": "a1", "timestamp": "2026-11-12T01:39:58.018Z",
+                "attachment": {"type": "queued_command", "prompt": "Then say bye.", "source_uuid": "src-1",
+                               "commandMode": "prompt"}})
+        self.assertEqual([(i["id"], i["kind"], i["text"]) for i in t.items], [("src-1", "user", "Then say bye.")])
+
+
+class TerminalOriginTests(unittest.TestCase):
+    def test_terminal_messages_do_not_notify_the_phone(self):
+        hub = FakeHub()
+        s = steerd.ClaudeSession(hub, {"sid": "o1", "agent": "claude", "cwd": "/work/shop", "title": "t"})
+
+        async def no_process():
+            pass
+
+        async def write(obj):
+            pass
+        s.ensure_process, s.write = no_process, write
+        run(s.send("from the desk", [], origin="terminal"))
+        self.assertFalse(s.phone_turn)
+        self.assertEqual(s.items[-1]["origin"], "terminal")
+        run(s.send("from the phone", [], origin="phone"))
+        self.assertTrue(s.phone_turn)
+        self.assertEqual(s.items[-1]["origin"], "phone")
+
+    def test_hub_counts_terminal_viewers_and_says_so_in_the_summary(self):
+        hub = steerd.Hub.__new__(steerd.Hub)
+        hub.clients, hub.sessions, hub.dirty, hub.flush_scheduled = set(), {}, set(), True
+
+        class W:
+            def write(self, data):
+                pass
+        phone, term = steerd.Client(W()), steerd.Client(W())
+        term.kind = "terminal"
+        phone.open, term.open = {"x"}, {"x"}
+        hub.clients = {phone, term}
+        self.assertEqual(hub.terminal_viewers("x"), 1)
+        s = steerd.ClaudeSession(hub, {"sid": "x", "agent": "claude", "cwd": "/w"})
+        self.assertEqual(s.summary()["terminals"], 1)
+        term.closed = True
+        self.assertEqual(hub.terminal_viewers("x"), 0)
+
+    def test_no_handback_while_a_steer_terminal_has_it(self):
+        hub = FakeHub()
+        hub.terminal_viewers = lambda sid: 1
+        s = steerd.ClaudeSession(hub, {"sid": "h1", "agent": "claude", "cwd": "/w"})
+        s.handback = {"term": {"via": "herdr", "pane": "p1", "bin": "/nonexistent"}, "argv": ["claude"]}
+        old = steerd.HANDBACK_DELAY
+        steerd.HANDBACK_DELAY = 0
+        try:
+            run(s._handback_later())
+        finally:
+            steerd.HANDBACK_DELAY = old
+        self.assertIsNone(s.handback)
+
+    def test_rel_path_matches_through_the_tmp_symlink(self):
+        if not os.path.isdir("/private/tmp"):
+            self.skipTest("macOS only")
+        self.assertEqual(steerd.rel_path("/tmp/x/notes.txt", "/private/tmp/x"), "notes.txt")
+
+
+def run(coro):
+    return asyncio.run(coro) if hasattr(asyncio, "run") else asyncio.get_event_loop().run_until_complete(coro)
+
+
+def strip(rows):
+    return [steerd.TERM_SEQ.sub("", r) for r in rows]
+
+
+class TerminalLayoutTests(unittest.TestCase):
+    def test_wide_characters_take_two_columns(self):
+        self.assertEqual(steerd.text_width("中文ab"), 6)
+        self.assertEqual(steerd.text_width(steerd.sgr("1", "中")), 2)
+        self.assertEqual(steerd.wrap_rows("中文中文中", 4), ["中文", "中文", "中"])
+
+    def test_wrapping_breaks_at_spaces(self):
+        self.assertEqual(steerd.wrap_rows("hello there world", 12), ["hello there", "world"])
+        self.assertEqual(steerd.wrap_rows("abcdefghij", 4), ["abcd", "efgh", "ij"])
+
+    def test_agent_text_cannot_move_the_cursor(self):
+        self.assertEqual(steerd.plain("ok\x1b[2J\x1b]0;title\x07\rdone\x08"), "okdone")
+
+    def test_fit_cuts_to_the_width(self):
+        self.assertEqual(steerd.TERM_SEQ.sub("", steerd.fit("中文字符", 5)), "中文…")
+
+    def test_input_rows_and_cursor(self):
+        rows, crow, ccol = steerd.edit_rows("abcdef", 6, 6, "> ")
+        self.assertEqual(rows, ["> abcd", "  ef"])
+        self.assertEqual((crow, ccol), (1, 4))
+        rows, crow, ccol = steerd.edit_rows("ab\ncd", 3, 20, "> ")
+        self.assertEqual(rows, ["> ab", "  cd"])
+        self.assertEqual((crow, ccol), (1, 2))
+        rows, crow, ccol = steerd.edit_rows("abcd", 4, 6, "> ")   # cursor after a full row wraps
+        self.assertEqual((rows, crow, ccol), (["> abcd", "  "], 1, 2))
+
+    def test_tool_lines(self):
+        item = {"kind": "tool", "tool": "Bash", "category": "command", "target": "npm test", "status": "ok",
+                "output": "\n".join("line %d" % i for i in range(10))}
+        rows = strip(r for line in steerd.item_lines(item) for r in steerd.layout(line, 80))
+        self.assertEqual(rows, ["✓ Bash  npm test", "  ⎿ …前面还有 6 行", "    line 6", "    line 7", "    line 8",
+                                "    line 9"])
+        item = {"kind": "tool", "tool": "Write", "category": "edit", "target": "a.txt", "status": "running",
+                "diff": "+hi"}
+        self.assertEqual(len(steerd.item_lines(item)), 1)        # the request shows the diff
+        self.assertEqual(steerd.item_lines({"kind": "tool", "tool": "AskUserQuestion", "category": "meta"}), [])
+
+
+class KeyReaderTests(unittest.TestCase):
+    def test_sequences_paste_and_a_lone_escape(self):
+        k = steerd.KeyReader()
+        self.assertEqual(k.feed("a\x1b[A\x1b[1;3D\x1bb\x7f"),
+                         [("key", "a"), ("key", "\x1b[A"), ("key", "\x1b[1;3D"), ("key", "\x1bb"), ("key", "\x7f")])
+        self.assertEqual(k.feed("\x1b[200~line 1\r\nline"), [])
+        self.assertEqual(k.feed(" 2\x1b[201~x"), [("paste", "line 1\r\nline 2"), ("key", "x")])
+        self.assertEqual(k.feed("\x1b"), [])
+        self.assertEqual(k.flush(), [("key", "\x1b")])
+        self.assertEqual(k.feed("\x1b["), [])                      # half a sequence waits
+        self.assertEqual(k.feed("B"), [("key", "\x1b[B")])
+
+    def test_line_edit(self):
+        e = steerd.LineEdit("hello world")
+        e.kill_word()
+        self.assertEqual((e.text, e.pos), ("hello ", 6))
+        e.insert("there\nnext")
+        self.assertTrue(e.line_up())
+        self.assertEqual(e.pos, 4)
+        e.kill_right()
+        self.assertEqual(e.text, "hell\nnext")
+        self.assertFalse(e.line_up())
+
+
+class TerminalChatTests(unittest.TestCase):
+    def chat(self):
+        c = steerd.TerminalChat({"cwd": "/w"})
+        c.width, c.height = 80, 30
+        c.sid = "s1"
+        return c
+
+    def test_streaming_text_prints_whole_lines_and_keeps_the_last_one_live(self):
+        c = self.chat()
+        c.on_event({"ev": "item", "sid": "s1", "item": {"id": "u1", "kind": "user", "text": "hi"}})
+        c.on_event({"ev": "item", "sid": "s1", "item": {"id": "a1", "kind": "assistant", "text": "", "streaming": True}})
+        c.on_event({"ev": "delta", "sid": "s1", "itemId": "a1", "text": "one\ntw"})
+        self.assertEqual(strip(c.take_commits()), ["› hi", "", "⏺ one"])
+        live, _, _ = c.live()
+        self.assertIn("  tw", strip(live))
+        c.on_event({"ev": "item", "sid": "s1", "item": {"id": "a1", "kind": "assistant", "text": "one\ntwo",
+                                                         "streaming": False}})
+        self.assertEqual(strip(c.take_commits()), ["  two"])
+        self.assertEqual(c.take_commits(), [])
+
+    def test_a_running_tool_holds_back_what_comes_after_it(self):
+        c = self.chat()
+        c.absorb({"id": "t1", "kind": "tool", "tool": "Bash", "category": "command", "target": "make", "status": "running"})
+        c.absorb({"id": "n1", "kind": "notice", "code": "compacted"})
+        self.assertEqual(c.take_commits(), [])
+        c.absorb({"id": "t1", "status": "ok"})
+        self.assertEqual(strip(c.take_commits()), ["✓ Bash  make", "· 上下文已压缩"])
+
+    def test_queued_messages_wait_below_until_claude_takes_them(self):
+        c = self.chat()
+        c.absorb({"id": "t1", "kind": "tool", "tool": "Bash", "category": "command", "target": "make", "status": "running"})
+        c.absorb({"id": "u2", "kind": "user", "text": "and then?", "queued": True, "origin": "phone"})
+        self.assertEqual(c.order, ["t1"])
+        self.assertIn("› and then?  ← 手机  排队中", strip(c.live()[0]))
+        c.absorb({"id": "t1", "status": "ok"})
+        c.absorb({"id": "u2", "queued": False})
+        self.assertEqual(c.order, ["t1", "u2"])
+        self.assertEqual(strip(c.take_commits())[-1], "› and then?  ← 手机")
+
+    def test_events_for_a_session_being_created_adopt_its_id(self):
+        c = self.chat()
+        c.sid = None
+        c.creating = object()
+        c.on_event({"ev": "item", "sid": "new-1", "item": {"id": "u1", "kind": "user", "text": "go"}})
+        self.assertEqual(c.sid, "new-1")
+        c.on_event({"ev": "item", "sid": "other", "item": {"id": "x", "kind": "user", "text": "not mine"}})
+        self.assertNotIn("x", c.items)
+
+    def test_request_keys(self):
+        c = self.chat()
+        sent = []
+
+        async def call_quiet(op, **params):
+            sent.append((op, params))
+        c.call_quiet = call_quiet
+        c.on_event({"ev": "request", "sid": "s1", "request": {"rid": "r1", "kind": "permission", "tool": "Bash",
+                                                              "target": "rm -rf build", "canAllowSession": True}})
+        c.req_since = 0
+        self.assertEqual([k for k, _ in steerd.request_options(c.requests[0])], ["allow", "allowSession", "deny", "note"])
+
+        async def go():
+            c.on_key("key", "4")                    # deny with a note
+            self.assertIsNotNone(c.note)
+            for ch in "use make clean":
+                c.on_key("key", ch)
+            c.on_key("key", "\r")
+            await asyncio.sleep(0)
+        run(go())
+        self.assertEqual(sent, [("session.respond", {"sid": "s1", "rid": "r1", "decision": "deny",
+                                                     "message": "use make clean", "answers": {}})])
+        self.assertEqual(c.requests, [])
+
+    def test_questions_are_answered_one_by_one(self):
+        c = self.chat()
+        sent = []
+
+        async def call_quiet(op, **params):
+            sent.append(params)
+        c.call_quiet = call_quiet
+        c.on_event({"ev": "request", "sid": "s1", "request": {"rid": "q1", "kind": "question", "questions": [
+            {"id": "Which db?", "question": "Which db?", "options": [{"label": "sqlite"}, {"label": "postgres"}]},
+            {"id": "Tags?", "question": "Tags?", "multiSelect": True, "options": [{"label": "a"}, {"label": "b"}]}]}})
+        c.req_since = 0
+
+        async def go():
+            c.on_key("key", "2")
+            self.assertEqual(c.q_index, 1)
+            c.on_key("key", "1")
+            c.on_key("key", "2")
+            c.on_key("key", "\r")
+            await asyncio.sleep(0)
+        run(go())
+        self.assertEqual(sent[0]["answers"], {"Which db?": "postgres", "Tags?": ["a", "b"]})
+        self.assertEqual(sent[0]["decision"], "allow")
+
+    def test_a_restarted_helper_does_not_reprint_the_timeline(self):
+        c = self.chat()
+        c.absorb({"id": "u-1", "kind": "user", "text": "hi", "ts": 100})
+        c.absorb({"id": "m:t0", "kind": "assistant", "text": "hello", "ts": 200})
+        c.take_commits()
+        c.apply_snapshot({"session": {"sid": "s1", "state": "idle"}, "items": [
+            {"id": "uuid-1", "kind": "user", "text": "hi", "ts": 90},
+            {"id": "uuid-2", "kind": "assistant", "text": "hello", "ts": 210},
+            {"id": "uuid-3", "kind": "user", "text": "new while away", "ts": 300}]}, fresh=False)
+        self.assertEqual(strip(c.take_commits()), ["", "› new while away"])
